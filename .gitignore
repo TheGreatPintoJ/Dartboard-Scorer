@@ -1,6 +1,7 @@
 .venv/
 __pycache__/
 *.pyc
+config.json
 calibration.json
 calibration.reference.png
 throws.csv

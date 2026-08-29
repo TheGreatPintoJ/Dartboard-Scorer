@@ -259,6 +259,14 @@ class DartDetector:
 
         tip = (float(ends[pick][0]), float(ends[pick][1]))
         board_mm = boards[pick]
+
+        # Nothing outside the physical board can be a dart stuck in it. Movement
+        # at the edge of frame - an arm reaching in, someone walking past, a
+        # shifting shadow - otherwise lands in the visit as a phantom MISS.
+        # A dart in the number ring is still a legitimate zero.
+        if radii[pick] > geo.R_BOARD:
+            return None
+
         score = geo.score_at(*board_mm)
 
         confidence = 1.0

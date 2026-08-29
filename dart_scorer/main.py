@@ -16,8 +16,10 @@ from . import render
 from .calibration import (
     Calibration, REFERENCE_POINTS, ellipse_reference_guess, fit_board_ellipse,
 )
+from .config import DEFAULT_CONFIG_PATH, AppConfig
 from .detector import DartDetector, State
 from .session import Session
+from .synthetic import draw_dart_on_board, synthetic_camera
 
 DEFAULT_CALIBRATION = "calibration.json"
 
@@ -283,49 +285,6 @@ def _run_loop(cap, calib, detector, session, args, log, show) -> None:
 # --------------------------------------------------------------------------- #
 # selftest - the whole pipeline on synthetic frames
 # --------------------------------------------------------------------------- #
-def synthetic_camera(width=960, height=720, skew=0.16, seed=7):
-    """A fake camera looking at the board from off to one side."""
-    from .calibration import CANON_SIZE, reference_canon_points
-
-    rng = np.random.default_rng(seed)
-    src = np.float32([[0, 0], [CANON_SIZE, 0], [CANON_SIZE, CANON_SIZE], [0, CANON_SIZE]])
-    m = min(width, height) * 0.92
-    cx, cy = width / 2, height / 2
-    dst = np.float32([
-        [cx - m / 2, cy - m / 2 * (1 - skew)],
-        [cx + m / 2, cy - m / 2 * (1 + skew)],
-        [cx + m / 2, cy + m / 2 * (1 - skew)],
-        [cx - m / 2, cy + m / 2 * (1 + skew)],
-    ])
-    H_cam = cv2.getPerspectiveTransform(src, dst)          # canonical -> camera
-    board = render.render_board()
-
-    def view(canvas):
-        img = cv2.warpPerspective(canvas, H_cam, (width, height))
-        noise = rng.normal(0, 1.6, img.shape).astype(np.float32)
-        return np.clip(img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
-
-    image_points = cv2.perspectiveTransform(
-        reference_canon_points().reshape(-1, 1, 2), H_cam).reshape(-1, 2)
-    calib = Calibration.from_points(image_points, (width, height))
-    return board, view, calib
-
-
-def draw_dart_on_board(canvas, x_mm, y_mm, length_mm=95.0, jitter_deg=0.0):
-    """Draw a dart lying in the board plane with its point at (x_mm, y_mm)."""
-    from .calibration import board_to_canon
-
-    angle = geo.angle_of(x_mm, y_mm) + jitter_deg
-    r = max(geo.radius_of(x_mm, y_mm), 1.0)
-    tail = geo.polar_to_board(r + length_mm, angle)
-    p0 = tuple(int(v) for v in board_to_canon(x_mm, y_mm))
-    p1 = tuple(int(v) for v in board_to_canon(*tail))
-    cv2.line(canvas, p0, p1, (60, 60, 60), 7, cv2.LINE_AA)          # barrel
-    cv2.line(canvas, p0, p1, (210, 210, 210), 3, cv2.LINE_AA)       # highlight
-    cv2.circle(canvas, p1, 9, (40, 200, 240), -1, cv2.LINE_AA)      # flight
-    return canvas
-
-
 def cmd_selftest(args) -> int:
     board, view, calib = synthetic_camera()
     detector = DartDetector(calib, settle_frames=3, min_area=150)
@@ -342,6 +301,8 @@ def cmd_selftest(args) -> int:
         (geo.polar_to_board(60, 90.0 - 18 * 15), "11"),
         (geo.polar_to_board(103, 90.0 + 18 * 7), "T16"),
         (geo.polar_to_board(190, 45.0), "MISS"),
+        # Beyond the board itself: movement, not a dart. Must be ignored.
+        (geo.polar_to_board(260, 200.0), "none"),
     ]
 
     canvas = board.copy()
@@ -380,6 +341,55 @@ def cmd_selftest(args) -> int:
         cv2.waitKey(0)
         cv2.destroyAllWindows()
     return 0 if passed == len(targets) else 1
+
+
+# --------------------------------------------------------------------------- #
+# serve - the web interface
+# --------------------------------------------------------------------------- #
+def cmd_serve(args) -> int:
+    from .engine import ScoringEngine
+    from .webapp import serve
+
+    config = AppConfig.load(args.config)
+    if args.source:
+        config.camera.source = args.source
+    if args.width:
+        config.camera.width = args.width
+    if args.height:
+        config.camera.height = args.height
+    if args.calibration:
+        config.calibration_path = args.calibration
+    if args.log:
+        config.log_path = args.log
+    config.save(args.config)
+
+    engine = ScoringEngine(config, config_path=args.config)
+
+    # A demo board has no physical camera to calibrate against, so install the
+    # calibration that matches it and the UI is usable the moment it loads.
+    if str(config.camera.source).lower() == "demo" and engine.calibration is None:
+        from .synthetic import DemoSource
+
+        engine.set_calibration(DemoSource().calibration.image_points)
+        print("demo source: installed the matching calibration")
+
+    engine.start()
+    httpd = serve(engine, args.host, args.port, token=args.token, verbose=args.verbose)
+    shown = args.host if args.host not in ("0.0.0.0", "::") else "<this machine>"
+    suffix = f"?token={args.token}" if args.token else ""
+    print(f"dart scorer on http://{shown}:{args.port}/{suffix}")
+    if args.host == "0.0.0.0":
+        print("listening on every interface - anyone on the network can watch "
+              "the camera" + ("" if args.token else "; consider --token"))
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nstopping")
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        engine.stop()
+    return 0
 
 
 # --------------------------------------------------------------------------- #
@@ -426,6 +436,21 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--log", help="append every detection to this CSV file")
     r.add_argument("--no-display", action="store_true", help="headless")
     r.set_defaults(func=cmd_run)
+
+    w = sub.add_parser("serve", help="run the web interface (no display needed)")
+    w.add_argument("--host", default="127.0.0.1",
+                   help="0.0.0.0 to reach it from other machines")
+    w.add_argument("--port", type=int, default=8080)
+    w.add_argument("--config", default=DEFAULT_CONFIG_PATH)
+    w.add_argument("--source", help="camera index, video file, URL, or 'demo'")
+    w.add_argument("--width", type=int)
+    w.add_argument("--height", type=int)
+    w.add_argument("--calibration", help="path to calibration.json")
+    w.add_argument("--log", help="path to the detections CSV")
+    w.add_argument("--token", help="require this token in the URL or "
+                                   "the X-Auth-Token header")
+    w.add_argument("--verbose", action="store_true", help="log every request")
+    w.set_defaults(func=cmd_serve)
 
     t = sub.add_parser("selftest", help="run the pipeline on synthetic throws")
     t.add_argument("--show", action="store_true", help="display each throw")

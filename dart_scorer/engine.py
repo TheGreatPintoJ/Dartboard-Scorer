@@ -1,0 +1,487 @@
+"""The scoring engine: owns the camera, the detector and the game state.
+
+Runs on its own thread so the web layer never blocks on a camera read, and so
+a browser disconnecting cannot interrupt scoring. Everything the HTTP layer
+needs is exposed through small, locked accessors.
+"""
+
+from __future__ import annotations
+
+import csv
+import threading
+import time
+from collections import deque
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+from . import geometry as geo
+from . import render
+from .calibration import Calibration
+from .config import AppConfig
+from .detector import DartDetector
+from .session import Session
+from .synthetic import DemoSource
+
+
+class EventHub:
+    """Fan-out of scoring events to any number of browser connections."""
+
+    def __init__(self, capacity: int = 200) -> None:
+        self._cond = threading.Condition()
+        self._events: deque = deque(maxlen=capacity)
+        self._seq = 0
+
+    def publish(self, kind: str, **data) -> None:
+        with self._cond:
+            self._seq += 1
+            self._events.append({"seq": self._seq, "type": kind,
+                                 "time": round(time.time(), 3), **data})
+            self._cond.notify_all()
+
+    def since(self, cursor: int, timeout: float = 25.0):
+        """Events newer than `cursor`, waiting up to `timeout` for one."""
+        with self._cond:
+            if self._seq <= cursor:
+                self._cond.wait(timeout)
+            return [e for e in self._events if e["seq"] > cursor], self._seq
+
+    @property
+    def cursor(self) -> int:
+        with self._cond:
+            return self._seq
+
+
+def open_source(camera_cfg):
+    """A camera, a video file, a stream URL, or the built-in demo board."""
+    source = str(camera_cfg.source).strip()
+    if source.lower() in ("demo", "synthetic", "test"):
+        return DemoSource(fps=30.0)
+    cap = cv2.VideoCapture(int(source) if source.isdigit() else source)
+    if camera_cfg.width:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, camera_cfg.width)
+    if camera_cfg.height:
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, camera_cfg.height)
+    if not cap.isOpened():
+        cap.release()
+        return None
+    return _CaptureSource(cap, source)
+
+
+class _CaptureSource:
+    def __init__(self, cap, name):
+        self._cap = cap
+        self.name = name
+
+    def read(self):
+        ok, frame = self._cap.read()
+        return frame if ok else None
+
+    def release(self):
+        self._cap.release()
+
+
+class ScoringEngine:
+    def __init__(self, config: AppConfig, config_path: str | None = None) -> None:
+        self.config = config
+        self.config_path = config_path
+        self.events = EventHub()
+
+        self._lock = threading.RLock()
+        self._frame_cond = threading.Condition()
+        self._running = False
+        self._thread: threading.Thread | None = None
+
+        self._source = None
+        self._reopen = True
+        self._raw: np.ndarray | None = None
+        self._jpeg: bytes | None = None
+        self._jpeg_seq = 0
+        self._viewers = 0
+        self._last_pull = 0.0
+
+        self.calibration: Calibration | None = None
+        self.detector: DartDetector | None = None
+        self.session = Session(list(config.game.players),
+                               start_score=config.game.start_score,
+                               double_out=config.game.double_out)
+        self._tips: list = []
+        self._state = "starting"
+        self._error: str | None = None
+        self._fps = 0.0
+        self._log_writer = None
+        self._log_file = None
+
+        self._load_calibration()
+
+    # ------------------------------------------------------------------ #
+    # lifecycle
+    # ------------------------------------------------------------------ #
+    def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, name="scoring", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=3.0)
+        with self._lock:
+            if self._source:
+                self._source.release()
+                self._source = None
+            if self._log_file:
+                self._log_file.close()
+                self._log_file = None
+
+    # ------------------------------------------------------------------ #
+    # calibration
+    # ------------------------------------------------------------------ #
+    def _load_calibration(self) -> None:
+        path = Path(self.config.calibration_path)
+        if not path.exists():
+            self._state = "no calibration"
+            return
+        try:
+            self.calibration = Calibration.load(path)
+            self._rebuild_detector()
+        except Exception as exc:                       # corrupt or hand-edited
+            self._error = f"could not load {path}: {exc}"
+            self._state = "no calibration"
+
+    def _rebuild_detector(self) -> None:
+        if self.calibration is None:
+            self.detector = None
+            return
+        d = self.config.detector
+        self.detector = DartDetector(
+            self.calibration,
+            diff_threshold=d.diff_threshold,
+            min_area=d.min_area,
+            max_area=d.max_area,
+            settle_frames=d.settle_frames,
+            motion_threshold=d.motion_threshold,
+            learn_frames=d.learn_frames,
+            min_elongation=d.min_elongation,
+            tip_mode=d.tip_mode,
+        )
+        self._tips.clear()
+
+    def set_calibration(self, points, save: bool = True) -> dict:
+        """Install a calibration from clicked image points."""
+        with self._lock:
+            size = None if self._raw is None else self._raw.shape[1::-1]
+            calib = Calibration.from_points(points, size)
+            self.calibration = calib
+            self._rebuild_detector()
+            if save:
+                calib.save(self.config.calibration_path)
+            self._state = "learning"
+        self.events.publish("calibration", points=calib.image_points,
+                            saved=bool(save))
+        return {"points": calib.image_points, "saved": bool(save)}
+
+    def clear_calibration(self) -> None:
+        with self._lock:
+            self.calibration = None
+            self.detector = None
+            self._tips.clear()
+            self._state = "no calibration"
+            Path(self.config.calibration_path).unlink(missing_ok=True)
+        self.events.publish("calibration", points=[], saved=False)
+
+    def auto_points(self) -> list | None:
+        """Best-effort marker placement from the board outline."""
+        from .calibration import ellipse_reference_guess, fit_board_ellipse
+
+        frame = self.latest_raw()
+        if frame is None:
+            return None
+        ellipse = fit_board_ellipse(frame)
+        return None if ellipse is None else ellipse_reference_guess(ellipse)
+
+    # ------------------------------------------------------------------ #
+    # configuration
+    # ------------------------------------------------------------------ #
+    def apply_config(self, patch: dict, save: bool = True) -> dict:
+        with self._lock:
+            touched = self.config.apply(patch)
+            if "camera" in touched:
+                self._reopen = True
+            if "detector" in touched:
+                self._rebuild_detector()
+            if "game" in touched:
+                self._new_game()
+            if save and self.config_path:
+                self.config.save(self.config_path)
+        self.events.publish("config", sections=touched)
+        return self.config.to_dict()
+
+    def _new_game(self) -> None:
+        g = self.config.game
+        self.session = Session(list(g.players), start_score=g.start_score,
+                               double_out=g.double_out)
+        self._tips.clear()
+
+    # ------------------------------------------------------------------ #
+    # commands
+    # ------------------------------------------------------------------ #
+    def command(self, name: str, **kwargs) -> dict:
+        with self._lock:
+            if name == "undo":
+                self.session.undo_dart()
+                if self._tips:
+                    self._tips.pop()
+            elif name == "end_turn":
+                self.session.end_turn()
+                self._tips.clear()
+            elif name == "new_game":
+                self._new_game()
+            elif name == "relearn":
+                if self.detector:
+                    # Learn from the frames that follow, not from the last one
+                    # captured - that may still show darts being pulled out.
+                    self.detector.reset_background()
+                    self._tips.clear()
+                    self._state = "learning"
+            elif name == "reconnect":
+                self._reopen = True
+            elif name == "throw" and isinstance(self._source, DemoSource):
+                self._source.throw(str(kwargs.get("target", "T20")))
+            elif name == "pull_darts" and isinstance(self._source, DemoSource):
+                self._source.clear()
+            else:
+                raise ValueError(f"unknown command {name!r}")
+        self.events.publish("command", command=name)
+        return self.status()
+
+    # ------------------------------------------------------------------ #
+    # frames
+    # ------------------------------------------------------------------ #
+    def latest_raw(self) -> np.ndarray | None:
+        with self._lock:
+            return None if self._raw is None else self._raw.copy()
+
+    def _encode(self, frame) -> bytes | None:
+        cam = self.config.camera
+        if cam.stream_scale and abs(cam.stream_scale - 1.0) > 1e-3:
+            frame = cv2.resize(frame, None, fx=cam.stream_scale, fy=cam.stream_scale)
+        ok, buf = cv2.imencode(".jpg", frame,
+                               [cv2.IMWRITE_JPEG_QUALITY, int(cam.stream_quality)])
+        return buf.tobytes() if ok else None
+
+    def snapshot(self, annotated: bool = True) -> bytes | None:
+        """One JPEG, encoded on demand."""
+        self._last_pull = time.time()
+        frame = self.latest_raw()
+        if frame is None:
+            return None
+        if annotated:
+            frame = self._annotate(frame)
+        return self._encode(frame)
+
+    def preview(self, points) -> bytes | None:
+        """Render the board overlay for candidate calibration points."""
+        frame = self.latest_raw()
+        if frame is None:
+            return None
+        try:
+            calib = Calibration.from_points(points, frame.shape[1::-1])
+        except Exception:
+            return None
+        render.draw_board_overlay(frame, calib, (0, 220, 255), 2)
+        for i, p in enumerate(points, 1):
+            cv2.drawMarker(frame, (int(p[0]), int(p[1])), (0, 255, 255),
+                           cv2.MARKER_CROSS, 20, 2)
+            cv2.putText(frame, str(i), (int(p[0]) + 10, int(p[1]) - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        return self._encode(frame)
+
+    def rectified(self) -> bytes | None:
+        """The board warped flat - the quickest check that a calibration is good."""
+        frame = self.latest_raw()
+        with self._lock:
+            calib = self.calibration
+        if frame is None or calib is None:
+            return None
+        return self._encode(cv2.resize(calib.warp(frame), (480, 480)))
+
+    def stream(self, timeout: float = 10.0):
+        """Yield annotated JPEG frames as they arrive."""
+        with self._frame_cond:
+            self._viewers += 1
+        try:
+            seq = -1
+            while self._running:
+                with self._frame_cond:
+                    if self._jpeg_seq == seq:
+                        self._frame_cond.wait(timeout)
+                    if self._jpeg is None or self._jpeg_seq == seq:
+                        continue
+                    seq = self._jpeg_seq
+                    frame = self._jpeg
+                yield frame
+        finally:
+            with self._frame_cond:
+                self._viewers -= 1
+
+    def _annotate(self, frame) -> np.ndarray:
+        with self._lock:
+            calib, tips, state, fps = self.calibration, list(self._tips), self._state, self._fps
+        view = frame.copy()
+        if calib is not None:
+            render.draw_board_overlay(view, calib, (0, 200, 255), 1)
+            for i, dart in enumerate(tips, 1):
+                colour = (0, 255, 120) if dart.confidence > 0.6 else (0, 180, 255)
+                render.draw_marker(view, dart.tip_image, f"{i}: {dart.label}", colour)
+        cv2.putText(view, f"{state.upper()}  {fps:.0f} fps", (14, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.putText(view, f"{state.upper()}  {fps:.0f} fps", (14, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1, cv2.LINE_AA)
+        return view
+
+    # ------------------------------------------------------------------ #
+    # status
+    # ------------------------------------------------------------------ #
+    def status(self) -> dict:
+        with self._lock:
+            s = self.session
+            visit = [{"label": d.label, "points": d.points,
+                      "confidence": d.confidence,
+                      "near_wire": d.score.near_wire,
+                      "radius_mm": round(geo.radius_of(*d.board_mm), 1),
+                      "board_mm": [round(d.board_mm[0], 1), round(d.board_mm[1], 1)],
+                      "tip": [round(d.tip_image[0], 1), round(d.tip_image[1], 1)]}
+                     for d in s.turn.darts]
+            demo = isinstance(self._source, DemoSource)
+            return {
+                "state": self._state,
+                "error": self._error,
+                "fps": round(self._fps, 1),
+                "calibrated": self.calibration is not None,
+                "calibration_points": self.calibration.image_points if self.calibration else [],
+                "frame_size": list(self._raw.shape[1::-1]) if self._raw is not None else None,
+                "demo": demo,
+                "demo_darts": list(self._source.darts) if demo else [],
+                "config": self.config.to_dict(),
+                "cursor": self.events.cursor,
+                "session": {
+                    "players": [{"name": p.name, "remaining": p.remaining,
+                                 "darts": p.darts_thrown} for p in s.players],
+                    "current": s.current,
+                    "visit": visit,
+                    "visit_total": s.turn.points,
+                    "busted": s.turn.busted,
+                    "complete": s.turn_complete,
+                    "messages": list(s.messages),
+                    "game": s.start_score,
+                },
+            }
+
+    # ------------------------------------------------------------------ #
+    # the loop
+    # ------------------------------------------------------------------ #
+    def _log(self, dart) -> None:
+        if not self.config.log_path:
+            return
+        if self._log_writer is None:
+            path = Path(self.config.log_path)
+            new = not path.exists()
+            self._log_file = open(path, "a", newline="", encoding="utf-8")
+            self._log_writer = csv.writer(self._log_file)
+            if new:
+                self._log_writer.writerow(
+                    ["timestamp", "player", "label", "points", "x_mm", "y_mm",
+                     "radius_mm", "angle_deg", "confidence"])
+        self._log_writer.writerow([
+            f"{time.time():.3f}", self.session.player.name, dart.label, dart.points,
+            f"{dart.board_mm[0]:.1f}", f"{dart.board_mm[1]:.1f}",
+            f"{geo.radius_of(*dart.board_mm):.1f}", f"{dart.score.angle_deg:.1f}",
+            dart.confidence])
+        self._log_file.flush()
+
+    def _publish_frame(self, frame) -> None:
+        if self._viewers <= 0 and time.time() - self._last_pull > 5.0:
+            return                                   # nobody is watching
+        jpeg = self._encode(self._annotate(frame))
+        if jpeg is None:
+            return
+        with self._frame_cond:
+            self._jpeg = jpeg
+            self._jpeg_seq += 1
+            self._frame_cond.notify_all()
+
+    def _loop(self) -> None:
+        last = time.time()
+        while self._running:
+            with self._lock:
+                need_source = self._source is None or self._reopen
+            if need_source:
+                with self._lock:
+                    if self._source:
+                        self._source.release()
+                    self._source = open_source(self.config.camera)
+                    self._reopen = False
+                    if self._source is None:
+                        self._state = "no camera"
+                        self._error = f"cannot open camera {self.config.camera.source!r}"
+                    else:
+                        self._error = None
+                        self._state = "learning" if self.calibration else "no calibration"
+                        if self.detector:
+                            self.detector.reset_background()
+                if self._source is None:
+                    self.events.publish("state", state="no camera", error=self._error)
+                    time.sleep(2.0)
+                    continue
+
+            frame = self._source.read()
+            if frame is None:
+                with self._lock:
+                    self._state = "no signal"
+                    self._source.release()
+                    self._source = None
+                self.events.publish("state", state="no signal")
+                time.sleep(1.0)
+                continue
+
+            now = time.time()
+            self._fps = 0.9 * self._fps + 0.1 / max(now - last, 1e-6)
+            last = now
+
+            with self._lock:
+                self._raw = frame
+                detector, calib = self.detector, self.calibration
+
+            if detector is not None and calib is not None:
+                result = detector.update(frame)
+                with self._lock:
+                    previous, self._state = self._state, result.state.value
+                for dart in result.darts:
+                    with self._lock:
+                        self.session.add_dart(dart)
+                        self._tips.append(dart)
+                        self._log(dart)
+                        message = self.session.messages[-1] if self.session.messages else ""
+                    self.events.publish(
+                        "dart", label=dart.label, points=dart.points,
+                        confidence=dart.confidence, near_wire=dart.score.near_wire,
+                        board_mm=[round(v, 1) for v in dart.board_mm],
+                        message=message, status=self.status())
+                if result.cleared:
+                    with self._lock:
+                        scored = self.session.turn.points
+                        had = bool(self.session.turn.darts)
+                        if had and self.config.game.auto_end_turn:
+                            self.session.end_turn()
+                        self._tips.clear()
+                    if had:
+                        self.events.publish("cleared", scored=scored,
+                                            status=self.status())
+                if previous != self._state:
+                    self.events.publish("state", state=self._state)
+
+            self._publish_frame(frame)

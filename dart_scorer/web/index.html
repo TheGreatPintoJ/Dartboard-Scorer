@@ -1,0 +1,564 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dart Scorer</title>
+<style>
+  :root {
+    --bg: #14161a; --panel: #1c1f26; --line: #2c313b; --text: #e7e9ee;
+    --muted: #949bab; --accent: #4ade80; --warn: #fbbf24; --bad: #f87171;
+    --blue: #60a5fa;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    padding: 12px 18px; border-bottom: 1px solid var(--line); background: var(--panel);
+    position: sticky; top: 0; z-index: 5;
+  }
+  h1 { font-size: 17px; margin: 0; font-weight: 650; letter-spacing: .2px; }
+  h2 { font-size: 13px; margin: 0 0 10px; text-transform: uppercase;
+       letter-spacing: .08em; color: var(--muted); font-weight: 600; }
+  .pill {
+    font-size: 12px; padding: 3px 10px; border-radius: 999px;
+    background: #262b34; border: 1px solid var(--line); color: var(--muted);
+    white-space: nowrap;
+  }
+  .pill.ok { color: var(--accent); border-color: #2f5d43; }
+  .pill.warn { color: var(--warn); border-color: #6b5320; }
+  .pill.bad { color: var(--bad); border-color: #6d3535; }
+  .spacer { flex: 1; }
+  main { display: grid; grid-template-columns: minmax(0,1.6fr) minmax(320px,1fr);
+         gap: 16px; padding: 16px; align-items: start; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--line);
+          border-radius: 12px; padding: 14px; margin-bottom: 16px; }
+  .videowrap { position: relative; line-height: 0; border-radius: 10px;
+               overflow: hidden; background: #000; }
+  #video { width: 100%; height: auto; display: block; }
+  /* the markers sit on top of the video, but clicks must reach the image */
+  #overlay { position: absolute; inset: 0; width: 100%; height: 100%;
+             pointer-events: none; }
+  .videowrap.placing { cursor: crosshair; }
+  .hint { font-size: 13px; color: var(--muted); margin: 10px 0 0; }
+  .hint b { color: var(--text); }
+  button, select, input {
+    font: inherit; color: var(--text); background: #262b34;
+    border: 1px solid var(--line); border-radius: 8px; padding: 7px 11px;
+  }
+  button { cursor: pointer; }
+  button:hover:not(:disabled) { border-color: #46506180; background: #2f3540; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.primary { background: #1f6f45; border-color: #2f8f5b; color: #eafff2; }
+  button.danger { background: #6b2b2b; border-color: #8a3a3a; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .row + .row { margin-top: 10px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 6px 4px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; font-size: 12px;
+       text-transform: uppercase; letter-spacing: .06em; }
+  tr.active td { color: var(--accent); font-weight: 600; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .visit { display: flex; gap: 8px; flex-wrap: wrap; min-height: 46px; align-items: center; }
+  .chip { border: 1px solid var(--line); background: #262b34; border-radius: 9px;
+          padding: 6px 12px; text-align: center; min-width: 62px; }
+  .chip .lbl { font-weight: 650; font-size: 17px; }
+  .chip .pts { font-size: 11px; color: var(--muted); }
+  .chip.low { border-color: #6b5320; }
+  .chip.empty { color: var(--muted); border-style: dashed; }
+  .total { font-size: 30px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 10px; }
+  label.field { display: flex; flex-direction: column; gap: 4px;
+                font-size: 12px; color: var(--muted); }
+  label.field input, label.field select { width: 100%; }
+  label.check { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+  label.check input { width: auto; }
+  #log { max-height: 260px; overflow-y: auto; font-size: 13px; }
+  #log div { padding: 4px 2px; border-bottom: 1px solid var(--line);
+             display: flex; gap: 8px; }
+  #log time { color: var(--muted); font-variant-numeric: tabular-nums; }
+  details summary { cursor: pointer; color: var(--muted); font-size: 13px;
+                    text-transform: uppercase; letter-spacing: .08em; font-weight: 600; }
+  details[open] summary { margin-bottom: 12px; }
+  .toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
+           background: #2f3540; border: 1px solid var(--line); padding: 9px 16px;
+           border-radius: 9px; opacity: 0; transition: opacity .25s; z-index: 9; }
+  .toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Dart Scorer</h1>
+  <span class="pill" id="state">connecting</span>
+  <span class="pill" id="fps">-- fps</span>
+  <span class="pill" id="calib">calibration ?</span>
+  <div class="spacer"></div>
+  <span class="pill" id="conn">live</span>
+</header>
+
+<main>
+  <section>
+    <div class="card">
+      <div class="videowrap" id="videowrap">
+        <img id="video" alt="camera">
+        <canvas id="overlay"></canvas>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <button id="btn-calibrate">Calibrate</button>
+        <button id="btn-auto" hidden>Auto-place</button>
+        <button id="btn-undo-point" hidden>Undo point</button>
+        <button id="btn-preview" hidden>Preview</button>
+        <button id="btn-save-calib" class="primary" hidden>Save calibration</button>
+        <button id="btn-cancel-calib" hidden>Cancel</button>
+        <button id="btn-rectified">Flat view</button>
+        <button id="btn-clear-calib" class="danger">Clear calibration</button>
+      </div>
+      <p class="hint" id="calib-hint">
+        Point a camera at the board, then calibrate once. It stays valid until
+        the camera moves.
+      </p>
+    </div>
+
+    <div class="card" id="demo-card" hidden>
+      <h2>Demo board</h2>
+      <div class="row">
+        <input id="demo-target" value="T20" size="6" aria-label="target">
+        <button id="btn-throw">Throw</button>
+        <button data-throw="T20">T20</button>
+        <button data-throw="D16">D16</button>
+        <button data-throw="50">Bull</button>
+        <button data-throw="MISS">Miss</button>
+        <button id="btn-pull">Pull darts</button>
+      </div>
+      <p class="hint">No camera needed - throws are drawn onto a synthetic board
+        and go through the same detection path as a real feed.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="card">
+      <h2>This visit</h2>
+      <div class="visit" id="visit"></div>
+      <div class="row" style="margin-top:12px; align-items:baseline">
+        <span class="total" id="visit-total">0</span>
+        <span class="pill" id="visit-note" hidden></span>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <button id="btn-undo">Undo dart</button>
+        <button id="btn-end">End visit</button>
+        <button id="btn-relearn">Re-learn board</button>
+        <button id="btn-newgame" class="danger">New game</button>
+      </div>
+    </div>
+
+    <div class="card" id="score-card">
+      <h2>Scoreboard</h2>
+      <table>
+        <thead><tr><th>Player</th><th class="num">Left</th><th class="num">Darts</th></tr></thead>
+        <tbody id="players"></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <details id="settings">
+        <summary>Settings</summary>
+
+        <h2 style="margin-top:14px">Camera</h2>
+        <div class="grid2">
+          <label class="field">Source
+            <input id="cfg-source" placeholder="0, /dev/video0, URL, demo"></label>
+          <label class="field">Width <input id="cfg-width" type="number"></label>
+          <label class="field">Height <input id="cfg-height" type="number"></label>
+          <label class="field">Stream quality
+            <input id="cfg-quality" type="number" min="20" max="95"></label>
+          <label class="field">Stream scale
+            <input id="cfg-scale" type="number" step="0.1" min="0.2" max="1"></label>
+        </div>
+        <div class="row"><button id="btn-cameras">Find cameras</button>
+          <span class="pill" id="cameras">-</span></div>
+
+        <h2 style="margin-top:16px">Detection</h2>
+        <div class="grid2">
+          <label class="field">Change threshold <input id="cfg-diff" type="number"></label>
+          <label class="field">Min blob px <input id="cfg-minarea" type="number"></label>
+          <label class="field">Max blob px <input id="cfg-maxarea" type="number"></label>
+          <label class="field">Settle frames <input id="cfg-settle" type="number"></label>
+          <label class="field">Motion px <input id="cfg-motion" type="number"></label>
+          <label class="field">Tip end
+            <select id="cfg-tip">
+              <option value="centre">nearer the bull</option>
+              <option value="lowest">lowest</option>
+              <option value="highest">highest</option>
+            </select></label>
+        </div>
+
+        <h2 style="margin-top:16px">Game</h2>
+        <div class="grid2">
+          <label class="field">Players (comma separated)
+            <input id="cfg-players"></label>
+          <label class="field">Start score
+            <select id="cfg-start">
+              <option value="0">free scoring</option>
+              <option value="301">301</option>
+              <option value="501">501</option>
+              <option value="701">701</option>
+            </select></label>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <label class="check"><input type="checkbox" id="cfg-doubleout"> double out</label>
+          <label class="check"><input type="checkbox" id="cfg-autoend"> end visit when darts are pulled</label>
+        </div>
+
+        <div class="row" style="margin-top:14px">
+          <button id="btn-apply" class="primary">Apply &amp; save</button>
+          <a href="/api/throws.csv" download><button type="button">Download log</button></a>
+        </div>
+        <p class="hint">Changing the camera reopens it; changing detection or game
+          settings restarts the current game.</p>
+      </details>
+    </div>
+
+    <div class="card">
+      <h2>Activity</h2>
+      <div id="log"></div>
+    </div>
+  </section>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const TOKEN = new URLSearchParams(location.search).get("token");
+const url = (p) => TOKEN ? p + (p.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(TOKEN) : p;
+
+let status = null;
+let placing = false;
+let points = [];
+let previewing = false;
+
+const LANDMARKS = [
+  "outer edge of the DOUBLE ring, middle of bed 20 (top)",
+  "outer edge of the DOUBLE ring, middle of bed 6 (right)",
+  "outer edge of the DOUBLE ring, middle of bed 3 (bottom)",
+  "outer edge of the DOUBLE ring, middle of bed 11 (left)",
+  "centre of the bull (optional, improves the fit)",
+];
+
+/* ---------------------------------------------------------------- video */
+function liveVideo() {
+  previewing = false;
+  $("video").src = url("/stream.mjpg") + (TOKEN ? "&" : "?") + "t=" + Date.now();
+}
+
+async function api(path, options = {}) {
+  const res = await fetch(url(path), {
+    headers: { "Content-Type": "application/json" }, ...options,
+  });
+  if (!res.ok) {
+    let message = res.statusText;
+    try { message = (await res.json()).error || message; } catch (e) {}
+    throw new Error(message);
+  }
+  return res.headers.get("Content-Type")?.startsWith("application/json")
+    ? res.json() : res.blob();
+}
+
+function toast(message, bad) {
+  const el = $("toast");
+  el.textContent = message;
+  el.style.borderColor = bad ? "#8a3a3a" : "#46506180";
+  el.classList.add("show");
+  clearTimeout(el._timer);
+  el._timer = setTimeout(() => el.classList.remove("show"), 2600);
+}
+
+/* ---------------------------------------------------------- calibration */
+function drawOverlay() {
+  const img = $("video"), canvas = $("overlay");
+  if (!img.clientWidth) return;
+  canvas.width = img.clientWidth;
+  canvas.height = img.clientHeight;
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (!placing) return;
+  const scale = canvas.width / (status?.frame_size?.[0] || img.naturalWidth || 1);
+  points.forEach((p, i) => {
+    const x = p[0] * scale, y = p[1] * scale;
+    ctx.strokeStyle = i < 4 ? "#fbbf24" : "#60a5fa";
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(x - 11, y); ctx.lineTo(x + 11, y);
+    ctx.moveTo(x, y - 11); ctx.lineTo(x, y + 11); ctx.stroke();
+    ctx.beginPath(); ctx.arc(x, y, 9, 0, 6.284); ctx.stroke();
+    ctx.fillStyle = ctx.strokeStyle;
+    ctx.font = "bold 13px system-ui";
+    ctx.fillText(String(i + 1), x + 13, y - 10);
+  });
+}
+
+function calibHint() {
+  const hint = $("calib-hint");
+  if (!placing) {
+    hint.innerHTML = status?.calibrated
+      ? "Calibrated. The rings drawn on the video should sit on the real wires - "
+        + "if they drifted, the camera moved: calibrate again."
+      : "<b>Not calibrated.</b> Press Calibrate and click the four landmarks on the board.";
+    return;
+  }
+  hint.innerHTML = points.length < LANDMARKS.length
+    ? `Click point <b>${points.length + 1}</b>: ${LANDMARKS[points.length]}`
+    : "All five placed. Press <b>Preview</b> to check the rings, then <b>Save</b>.";
+}
+
+function setPlacing(on) {
+  placing = on;
+  $("videowrap").classList.toggle("placing", on);
+  for (const id of ["btn-auto", "btn-undo-point", "btn-preview",
+                    "btn-save-calib", "btn-cancel-calib"]) $(id).hidden = !on;
+  $("btn-calibrate").hidden = on;
+  $("btn-clear-calib").hidden = on;
+  $("btn-rectified").hidden = on;
+  $("btn-save-calib").disabled = points.length < 4;
+  $("btn-preview").disabled = points.length < 4;
+  if (!on) points = [];
+  if (previewing) liveVideo();
+  drawOverlay();
+  calibHint();
+}
+
+$("video").addEventListener("click", (event) => {
+  if (!placing || points.length >= LANDMARKS.length) return;
+  const img = $("video"), rect = img.getBoundingClientRect();
+  const natural = status?.frame_size?.[0] || img.naturalWidth;
+  const scale = natural / rect.width;
+  points.push([(event.clientX - rect.left) * scale, (event.clientY - rect.top) * scale]);
+  if (previewing) liveVideo();
+  $("btn-save-calib").disabled = points.length < 4;
+  $("btn-preview").disabled = points.length < 4;
+  drawOverlay(); calibHint();
+});
+
+$("btn-calibrate").onclick = () => { points = []; setPlacing(true); };
+$("btn-cancel-calib").onclick = () => setPlacing(false);
+$("btn-undo-point").onclick = () => {
+  points.pop();
+  $("btn-save-calib").disabled = points.length < 4;
+  $("btn-preview").disabled = points.length < 4;
+  if (previewing) liveVideo();
+  drawOverlay(); calibHint();
+};
+
+$("btn-auto").onclick = async () => {
+  try {
+    const data = await api("/api/calibration/auto", { method: "POST", body: "{}" });
+    points = data.points;
+    drawOverlay(); calibHint();
+    $("btn-save-calib").disabled = false;
+    $("btn-preview").disabled = false;
+    toast("Markers placed on the detected outline - drag order starts at bed 20");
+  } catch (err) { toast(err.message, true); }
+};
+
+$("btn-preview").onclick = async () => {
+  try {
+    const blob = await api("/api/calibration/preview",
+      { method: "POST", body: JSON.stringify({ points }) });
+    $("video").src = URL.createObjectURL(blob);
+    previewing = true;
+    toast("Preview - the rings should sit on the wires");
+  } catch (err) { toast(err.message, true); }
+};
+
+$("btn-save-calib").onclick = async () => {
+  try {
+    await api("/api/calibration",
+      { method: "POST", body: JSON.stringify({ points, save: true }) });
+    setPlacing(false);
+    liveVideo();
+    toast("Calibration saved");
+  } catch (err) { toast(err.message, true); }
+};
+
+$("btn-clear-calib").onclick = async () => {
+  if (!confirm("Delete the saved calibration?")) return;
+  await api("/api/calibration", { method: "DELETE" });
+  toast("Calibration cleared");
+};
+
+$("btn-rectified").onclick = () => {
+  if (previewing) { liveVideo(); return; }
+  $("video").src = url("/rectified.jpg") + (TOKEN ? "&" : "?") + "t=" + Date.now();
+  previewing = true;
+  toast("Flat view - press again for live video");
+};
+
+/* ------------------------------------------------------------- commands */
+async function command(name, extra = {}) {
+  try { render(await api("/api/command",
+    { method: "POST", body: JSON.stringify({ command: name, ...extra }) })); }
+  catch (err) { toast(err.message, true); }
+}
+$("btn-undo").onclick = () => command("undo");
+$("btn-end").onclick = () => command("end_turn");
+$("btn-relearn").onclick = () => command("relearn");
+$("btn-newgame").onclick = () => command("new_game");
+$("btn-throw").onclick = () => command("throw", { target: $("demo-target").value });
+$("btn-pull").onclick = () => command("pull_darts");
+document.querySelectorAll("[data-throw]").forEach((b) =>
+  b.onclick = () => command("throw", { target: b.dataset.throw }));
+
+$("btn-cameras").onclick = async () => {
+  $("cameras").textContent = "scanning...";
+  try {
+    const data = await api("/api/cameras");
+    $("cameras").textContent = data.cameras.length
+      ? "found: " + data.cameras.join(", ") : "none found";
+  } catch (err) { $("cameras").textContent = "failed"; }
+};
+
+$("btn-apply").onclick = async () => {
+  const patch = {
+    camera: {
+      source: $("cfg-source").value, width: +$("cfg-width").value,
+      height: +$("cfg-height").value, stream_quality: +$("cfg-quality").value,
+      stream_scale: +$("cfg-scale").value,
+    },
+    detector: {
+      diff_threshold: +$("cfg-diff").value, min_area: +$("cfg-minarea").value,
+      max_area: +$("cfg-maxarea").value, settle_frames: +$("cfg-settle").value,
+      motion_threshold: +$("cfg-motion").value, tip_mode: $("cfg-tip").value,
+    },
+    game: {
+      players: $("cfg-players").value.split(",").map((s) => s.trim()).filter(Boolean),
+      start_score: +$("cfg-start").value,
+      double_out: $("cfg-doubleout").checked,
+      auto_end_turn: $("cfg-autoend").checked,
+    },
+  };
+  try {
+    await api("/api/config", { method: "POST", body: JSON.stringify(patch) });
+    toast("Saved");
+    setTimeout(liveVideo, 400);
+  } catch (err) { toast(err.message, true); }
+};
+
+/* --------------------------------------------------------------- render */
+let settingsTouched = false;
+$("settings").addEventListener("input", () => settingsTouched = true);
+
+function fillSettings(cfg) {
+  if (settingsTouched) return;              // do not fight the operator
+  $("cfg-source").value = cfg.camera.source;
+  $("cfg-width").value = cfg.camera.width;
+  $("cfg-height").value = cfg.camera.height;
+  $("cfg-quality").value = cfg.camera.stream_quality;
+  $("cfg-scale").value = cfg.camera.stream_scale;
+  $("cfg-diff").value = cfg.detector.diff_threshold;
+  $("cfg-minarea").value = cfg.detector.min_area;
+  $("cfg-maxarea").value = cfg.detector.max_area;
+  $("cfg-settle").value = cfg.detector.settle_frames;
+  $("cfg-motion").value = cfg.detector.motion_threshold;
+  $("cfg-tip").value = cfg.detector.tip_mode;
+  $("cfg-players").value = cfg.game.players.join(", ");
+  $("cfg-start").value = String(cfg.game.start_score);
+  $("cfg-doubleout").checked = cfg.game.double_out;
+  $("cfg-autoend").checked = cfg.game.auto_end_turn;
+}
+
+function render(next) {
+  if (!next) return;
+  status = next;
+  const state = $("state");
+  state.textContent = status.error || status.state;
+  state.className = "pill " + (status.error || status.state.startsWith("no ")
+    ? "bad" : status.state === "ready" ? "ok" : "warn");
+  $("fps").textContent = status.fps.toFixed(0) + " fps";
+  $("calib").textContent = status.calibrated ? "calibrated" : "not calibrated";
+  $("calib").className = "pill " + (status.calibrated ? "ok" : "bad");
+  $("demo-card").hidden = !status.demo;
+
+  const s = status.session;
+  const visit = $("visit");
+  visit.innerHTML = "";
+  for (let i = 0; i < 3; i++) {
+    const dart = s.visit[i];
+    const chip = document.createElement("div");
+    chip.className = "chip" + (dart ? (dart.confidence < 0.6 ? " low" : "") : " empty");
+    chip.innerHTML = dart
+      ? `<div class="lbl">${dart.label}</div><div class="pts">${dart.points} pts</div>`
+      : `<div class="lbl">-</div><div class="pts">&nbsp;</div>`;
+    if (dart && dart.near_wire) chip.title = "landed close to a wire - worth checking";
+    visit.appendChild(chip);
+  }
+  $("visit-total").textContent = s.visit_total;
+  const note = $("visit-note");
+  note.hidden = !(s.busted || s.complete);
+  note.textContent = s.busted ? "BUST" : "visit complete - pull the darts";
+  note.className = "pill " + (s.busted ? "bad" : "warn");
+
+  $("score-card").hidden = !s.game;
+  $("players").innerHTML = s.players.map((p, i) =>
+    `<tr class="${i === s.current ? "active" : ""}"><td>${p.name}</td>` +
+    `<td class="num">${s.game ? p.remaining : "-"}</td>` +
+    `<td class="num">${p.darts}</td></tr>`).join("");
+
+  fillSettings(status.config);
+  calibHint();
+  drawOverlay();
+}
+
+function logLine(text) {
+  const row = document.createElement("div");
+  const time = new Date().toLocaleTimeString();
+  row.innerHTML = `<time>${time}</time><span>${text}</span>`;
+  $("log").prepend(row);
+  while ($("log").childElementCount > 60) $("log").lastElementChild.remove();
+}
+
+/* ---------------------------------------------------------------- events */
+function connect() {
+  const source = new EventSource(url("/api/events"));
+  source.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+    $("conn").textContent = "live";
+    $("conn").className = "pill ok";
+    if (data.status) render(data.status);
+    else if (data.state && !data.type) render(data);       // first payload
+    if (data.type === "dart") {
+      logLine(`<b>${data.label}</b> for ${data.points}` +
+        (data.near_wire ? " (near a wire)" : "") +
+        (data.confidence < 0.6 ? ` - low confidence ${data.confidence}` : ""));
+    } else if (data.type === "cleared") {
+      logLine(`darts pulled - visit scored ${data.scored}`);
+    } else if (data.type === "state") {
+      logLine("state: " + data.state);
+      api("/api/status").then(render).catch(() => {});
+    } else if (data.type === "calibration") {
+      logLine(data.points.length ? "calibration updated" : "calibration cleared");
+      api("/api/status").then(render).catch(() => {});
+    } else if (data.type === "config") {
+      settingsTouched = false;
+      api("/api/status").then(render).catch(() => {});
+    }
+  };
+  source.onerror = () => {
+    $("conn").textContent = "reconnecting";
+    $("conn").className = "pill bad";
+    source.close();
+    setTimeout(connect, 2000);
+  };
+}
+
+window.addEventListener("resize", drawOverlay);
+$("video").addEventListener("load", drawOverlay);
+liveVideo();
+api("/api/status").then(render).catch((err) => toast(err.message, true));
+connect();
+</script>
+</body>
+</html>

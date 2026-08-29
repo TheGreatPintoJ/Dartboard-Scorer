@@ -1,0 +1,63 @@
+[Unit]
+Description=Dartboard scorer web service
+Documentation=https://github.com/local/dart-scorer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=dartscorer
+Group=dartscorer
+# Needed to open /dev/video* on most distributions.
+SupplementaryGroups=video
+
+WorkingDirectory=/opt/dart-scorer
+Environment=PYTHONUNBUFFERED=1
+Environment=DART_HOST=0.0.0.0
+Environment=DART_PORT=8080
+Environment=DART_SOURCE=0
+Environment=DART_TOKEN=
+# Override any of the above without editing this unit.
+EnvironmentFile=-/etc/default/dart-scorer
+
+# Config, calibration and the throw log live in /var/lib/dart-scorer, which
+# StateDirectory creates and makes writable even under ProtectSystem=strict.
+StateDirectory=dart-scorer
+ExecStart=/opt/dart-scorer/.venv/bin/python -m dart_scorer serve \
+    --host ${DART_HOST} \
+    --port ${DART_PORT} \
+    --source ${DART_SOURCE} \
+    --token ${DART_TOKEN} \
+    --config /var/lib/dart-scorer/config.json \
+    --calibration /var/lib/dart-scorer/calibration.json \
+    --log /var/lib/dart-scorer/throws.csv
+
+Restart=always
+RestartSec=3
+# A camera that disappears makes the process retry rather than exit, so a
+# restart loop here means something is genuinely wrong.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# --- hardening -------------------------------------------------------------
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# Cameras are character devices, so PrivateDevices must stay off; allow only
+# video4linux nodes through instead.
+PrivateDevices=no
+DevicePolicy=closed
+DeviceAllow=char-video4linux rw
+
+[Install]
+WantedBy=multi-user.target

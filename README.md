@@ -1,72 +1,115 @@
 # Dartboard Scorer
 
 Reads a camera pointed at a dartboard and calls the score of every dart that
-lands: `T20`, `D16`, `BULL`, `MISS`. Keeps a running visit total and, if you
-want it, a game of 501.
+lands: `T20`, `D16`, `BULL`, `MISS`. Runs as a headless service with a web
+interface, so a machine in the corner with a webcam does the scoring and any
+phone or laptop on the network watches the game.
 
-```
-  T20   60 pts   r= 103.4mm  conf=1.00
-    1    1 pts   r= 139.8mm  conf=1.00
-   D4    8 pts   r= 165.6mm  conf=1.00
--- board cleared: 69 scored --
-```
+Everything is driven from the browser - camera selection, calibration, detection
+tuning, the game itself. Nothing needs a screen attached to the scoring machine.
 
 ## Install
 
 ```bash
 python -m venv .venv
-.venv/Scripts/activate          # Windows;  source .venv/bin/activate elsewhere
+.venv/Scripts/activate           # Windows;  source .venv/bin/activate elsewhere
 pip install -r requirements.txt
 ```
 
-## Use it
+Only OpenCV and NumPy. The web server is standard library.
 
-**1. Calibrate** (once per camera position):
+## Run it
 
 ```bash
-python -m dart_scorer calibrate --source 0
+python -m dart_scorer serve --source 0                    # http://127.0.0.1:8080
+python -m dart_scorer serve --host 0.0.0.0 --token hunter2 # reachable on the LAN
+python -m dart_scorer serve --source demo                 # no camera needed
 ```
 
-Click four landmarks, in this order:
+Open the address it prints. Then:
 
-1. the outer edge of the double ring in the middle of bed **20** (top)
-2. the same for bed **6** (right)
-3. bed **3** (bottom)
-4. bed **11** (left)
-5. optionally, the centre of the bull - a fifth point tightens the fit
+1. **Calibrate** - press Calibrate and click four landmarks on the video:
+   the outer edge of the double ring in the middle of bed **20** (top), then
+   **6** (right), **3** (bottom), **11** (left). A fifth click on the bull
+   sharpens the fit. Press Preview to check the rings sit on the real wires,
+   then Save. This holds until the camera moves.
+2. **Throw.** Darts are scored as they land. Pull them out and the visit ends.
 
-Drag any marker to nudge it. The rings drawn over your camera view, and the
-rectified board in the second window, tell you when it is right: the yellow
-rings should sit exactly on the real wires. Press `a` to have the board outline
-found automatically and the markers pre-placed, then drag them into position.
-`s` saves to `calibration.json`.
+`--source demo` runs a synthetic board with no hardware: throw darts from the
+browser and watch them go through the same detection path as a real feed. It is
+the quickest way to see the whole thing working.
 
-**2. Score:**
+### Command line, without the web interface
 
 ```bash
-python -m dart_scorer run --source 0                 # free scoring
+python -m dart_scorer calibrate --source 0      # OpenCV window, click landmarks
 python -m dart_scorer run --game 501 --players Kyle Sam
-python -m dart_scorer run --log throws.csv           # log every dart
+python -m dart_scorer selftest                  # synthetic throws, no camera
+python -m dart_scorer board --out board.png     # reference board image
 ```
 
-Keys while running: `b` re-learn the empty board, `u` undo a dart, `n` end the
-visit, `m` show the change mask, `p` pause, `q` quit.
-
-**3. Check it without a camera:**
+## Running as a Linux service
 
 ```bash
-python -m dart_scorer selftest    # synthetic throws through the whole pipeline
-python tests/test_geometry.py     # scoring geometry
-python tests/test_session.py      # visits, busts, checkouts, undo
-python -m dart_scorer board       # write a reference board image
+sudo ./deploy/install.sh --source 0 --port 8080
 ```
+
+That creates a `dartscorer` system user, installs the code to `/opt/dart-scorer`
+with its own virtualenv, writes settings to `/etc/default/dart-scorer`, and
+enables `dart-scorer.service`. Config, calibration and the throw log live in
+`/var/lib/dart-scorer` and survive reinstalls.
+
+```bash
+systemctl status dart-scorer
+journalctl -u dart-scorer -f
+systemctl restart dart-scorer         # after editing /etc/default/dart-scorer
+```
+
+Settings in `/etc/default/dart-scorer`: `DART_HOST`, `DART_PORT`, `DART_SOURCE`,
+`DART_TOKEN`. The unit runs with `ProtectSystem=strict`, a restricted syscall
+set and access to video devices only. `deploy/nginx-dart-scorer.conf` is there
+if you want TLS or a hostname in front - it turns off proxy buffering, which
+both the video stream and the event stream need.
+
+On a Raspberry Pi or similar, install `opencv-python-headless`; the install
+script prefers it already. Drop `stream_scale` to 0.5 and `stream_quality` to
+60 in Settings if the network is the bottleneck.
+
+## HTTP interface
+
+| endpoint | what it does |
+|---|---|
+| `GET /` | the control page |
+| `GET /stream.mjpg` | live annotated video (multipart JPEG) |
+| `GET /snapshot.jpg`, `GET /rectified.jpg` | one frame; the board warped flat |
+| `GET /api/status` | state, scoreboard, current visit, config |
+| `GET /api/events` | server-sent events: darts, state changes |
+| `GET`/`POST /api/config` | read or change any setting |
+| `GET`/`POST`/`DELETE /api/calibration` | the board landmarks |
+| `POST /api/calibration/auto`, `/preview` | suggested landmarks; overlay preview |
+| `POST /api/command` | `undo`, `end_turn`, `new_game`, `relearn`, `reconnect`, `throw` |
+| `GET /api/throws.csv` | every detection, logged |
+| `GET /healthz` | liveness probe, no token needed |
+
+So a scoreboard on a TV, a Home Assistant card or a league bot is a matter of
+reading `/api/events`. Example:
+
+```bash
+curl -N http://darts.local:8080/api/events
+curl -X POST -d '{"command":"undo"}' http://darts.local:8080/api/command
+```
+
+With `--token` set, pass it as `?token=...` or an `X-Auth-Token` header. Opening
+the page once with `?token=...` sets a cookie, so the browser keeps working.
+There is no user accounts system: the token is a shared secret for a home LAN,
+and the video stream is unencrypted unless you put nginx in front.
 
 ## How it works
 
 **Calibration.** A dartboard is flat, so one homography undoes any camera angle.
-Four known landmarks give that homography; from then on any pixel can be turned
-into a millimetre position on the board, and radius plus angle give the score
-using the official ring dimensions.
+Four known landmarks give that homography; from then on any pixel becomes a
+millimetre position on the board, and radius plus angle give the score using the
+official ring dimensions.
 
 **Detection.** The camera does not move, so everything is differencing, against
 two references:
@@ -74,52 +117,69 @@ two references:
 - an **empty-board** frame - tells us how many darts are in the board and when
   the board has been cleared;
 - the frame as it looked **after the previous dart settled** - differencing
-  against this isolates only the newest dart, which is what keeps three darts
-  in the treble 20 resolvable. They touch in space, but they are separated in
-  time.
+  against this isolates only the newest dart, which is what keeps three darts in
+  the treble 20 resolvable. They touch in space, but they are separated in time.
 
-Nothing is measured until the image has held still for a few frames, so darts
-in flight and hands in shot never produce a score.
+Nothing is measured until the image has held still for a few frames, so darts in
+flight and hands in shot never produce a score.
 
 **Finding the point.** The new blob is the dart. Its principal axis is the shaft;
-the two ends of that axis are the point and the flight. The barrel always
-extends away from the centre of the board, so the end nearer the bull is the
-point. The last few pixels at that end are averaged, which keeps the answer
-stable to about 1.5 mm - comfortably finer than the 8 mm treble ring.
+the two ends of that axis are the point and the flight. The barrel always extends
+away from the centre of the board, so the end nearer the bull is the point. The
+last few pixels at that end are averaged, which keeps the answer stable to about
+1.5 mm - comfortably finer than the 8 mm treble ring.
+
+A blob whose point falls outside the physical board is discarded rather than
+scored: an arm reaching in, someone walking past or a shifting shadow cannot be
+a dart stuck in the board. A dart in the number ring is still a legitimate zero.
 
 Each dart carries a confidence, knocked down when the blob is not dart-shaped,
 when it lands off the scoring area, or when it lands within a wire's width of a
-boundary. Low-confidence calls are drawn in amber - those are the ones to check.
+boundary. Low-confidence calls are marked in amber - those are the ones to check.
 
 ## Tuning
 
-Defaults suit a 1280x720 webcam a metre or so from the board. If it misses
-darts, lower `--min-area` and `--diff`; if it invents them, raise both.
+Defaults suit a 1280x720 webcam a metre or so from the board. All of it is in
+Settings in the web UI; the CLI has matching flags.
 
-| flag | default | what it does |
+| setting | default | what it does |
 |---|---|---|
-| `--diff` | 26 | grey-level change that counts as "different" |
-| `--min-area` | 220 | smallest blob accepted as a dart, in pixels |
-| `--settle` | 4 | still frames required before scoring |
-| `--motion` | 120 | changed pixels per frame that count as movement |
-| `--tip` | centre | which end of the blob is the point |
+| change threshold | 26 | grey-level change that counts as "different" |
+| min blob px | 220 | smallest blob accepted as a dart |
+| max blob px | 26000 | largest; beyond 3x this the board is treated as occluded |
+| settle frames | 4 | still frames required before scoring |
+| motion px | 120 | changed pixels per frame that count as movement |
+| tip end | nearer the bull | which end of the blob is the point |
 
-Practical rig notes: bolt the camera down (any shift needs re-calibration), light
-the board evenly and avoid a light that swings when a dart hits, and keep the
-camera off to one side rather than straight on so darts stand out from the face
-of the board.
+If it misses darts, lower the threshold and the minimum blob size; if it invents
+them, raise both. Bolt the camera down - any shift needs re-calibration - light
+the board evenly, and put the camera off to one side rather than straight on so
+darts stand out from the face of the board.
+
+## Testing
+
+```bash
+python -m dart_scorer selftest    # synthetic throws through the whole pipeline
+python tests/test_geometry.py     # scoring geometry
+python tests/test_session.py      # visits, busts, checkouts, undo
+python tests/test_webapp.py       # the live service, end to end, no camera
+```
+
+`test_webapp.py` starts the real server on a spare port, throws darts at the
+demo board and checks the HTTP surface reports them.
 
 ## Known limits
 
 - **One camera cannot see depth.** A dart at a steep angle is measured where its
   point *appears*, so an extreme angle can read a millimetre or two off. The fix
   is a second camera at ~90 degrees, intersecting two rays - the geometry and
-  calibration here already support that; the fusion step is not written.
+  calibration support that; the fusion step is not written.
 - **A dart hidden behind another** will not be seen as a separate blob. It is
   logged as a low-confidence detection rather than silently scored wrong.
-- **Wire calls** are flagged, not resolved. Anything landing within a millimetre
-  of a wire is worth a glance.
+- **Wire calls** are flagged, not resolved.
 - Bouncers and darts that fall out are handled as removals, not as scores.
+- The server is `http.server` with threads: fine for a handful of viewers on a
+  home network, not a public deployment.
 
 ## Layout
 
@@ -129,12 +189,20 @@ dart_scorer/
   calibration.py  camera <-> board homography, save/load, board outline finder
   detector.py     background differencing, settle logic, tip estimation
   session.py      visits, 3-dart turns, X01 with double-out
+  engine.py       the scoring thread: camera, detection, state, events
+  webapp.py       HTTP routes, MJPEG stream, server-sent events
+  web/index.html  the browser interface
+  config.py       runtime settings, persisted to config.json
+  synthetic.py    the demo board, used by the tests and --source demo
   render.py       board drawing and the live overlay
-  main.py         calibrate / run / selftest / board
+  main.py         serve / calibrate / run / selftest / board
+deploy/
+  dart-scorer.service      systemd unit
+  install.sh               one-shot installer
+  nginx-dart-scorer.conf   optional reverse proxy
 tests/
-  test_geometry.py
-  test_session.py
 ```
 
 `board.png` is a reference render of the canonical board; `example_overlay.png`
-shows the live view - overlay rings on the board, marked tips, running score.
+and `web_snapshot.png` show the live view - overlay rings on the board, marked
+tips, running score.
