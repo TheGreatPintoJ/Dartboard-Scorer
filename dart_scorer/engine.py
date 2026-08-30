@@ -19,6 +19,7 @@ import numpy as np
 from . import geometry as geo
 from . import render
 from .calibration import Calibration
+from .camera import GEOMETRY_CONTROLS, open_capture
 from .config import AppConfig
 from .detector import DartDetector
 from .session import Session
@@ -58,28 +59,7 @@ def open_source(camera_cfg):
     source = str(camera_cfg.source).strip()
     if source.lower() in ("demo", "synthetic", "test"):
         return DemoSource(fps=30.0)
-    cap = cv2.VideoCapture(int(source) if source.isdigit() else source)
-    if camera_cfg.width:
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, camera_cfg.width)
-    if camera_cfg.height:
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, camera_cfg.height)
-    if not cap.isOpened():
-        cap.release()
-        return None
-    return _CaptureSource(cap, source)
-
-
-class _CaptureSource:
-    def __init__(self, cap, name):
-        self._cap = cap
-        self.name = name
-
-    def read(self):
-        ok, frame = self._cap.read()
-        return frame if ok else None
-
-    def release(self):
-        self._cap.release()
+    return open_capture(camera_cfg)
 
 
 class ScoringEngine:
@@ -100,6 +80,7 @@ class ScoringEngine:
         self._jpeg_seq = 0
         self._viewers = 0
         self._last_pull = 0.0
+        self._last_publish = 0.0
 
         self.calibration: Calibration | None = None
         self.detector: DartDetector | None = None
@@ -206,19 +187,72 @@ class ScoringEngine:
     # ------------------------------------------------------------------ #
     # configuration
     # ------------------------------------------------------------------ #
+    # Changing any of these means tearing the capture down and opening it
+    # again; the rest can be pushed at a running camera.
+    REOPEN_ON = frozenset({"source", "width", "height", "fourcc", "fps",
+                           "backend", "buffer_size"})
+
     def apply_config(self, patch: dict, save: bool = True) -> dict:
         with self._lock:
-            touched = self.config.apply(patch)
-            if "camera" in touched:
+            changed = self.config.apply(patch)
+            camera = {k.split(".", 1)[1] for k in changed if k.startswith("camera.")}
+            if camera & self.REOPEN_ON:
                 self._reopen = True
-            if "detector" in touched:
+            elif "controls" in camera:
+                self._push_controls()
+            if any(k.startswith("detector.") for k in changed):
                 self._rebuild_detector()
-            if "game" in touched:
+            if any(k.startswith("game.") for k in changed):
                 self._new_game()
             if save and self.config_path:
                 self.config.save(self.config_path)
-        self.events.publish("config", sections=touched)
+        self.events.publish("config", changed=changed)
         return self.config.to_dict()
+
+    # ------------------------------------------------------------------ #
+    # camera controls
+    # ------------------------------------------------------------------ #
+    def _push_controls(self) -> dict:
+        """Send the configured controls to the open camera. Caller holds the lock."""
+        source = self._source
+        if source is None or not hasattr(source, "apply_controls"):
+            return {}
+        readback = source.apply_controls(dict(self.config.camera.controls))
+        # Focus, exposure and the rest all change how the board looks, so the
+        # empty-board reference the detector diffs against is now wrong.
+        if self.detector is not None:
+            self.detector.reset_background()
+            self._tips.clear()
+            self._state = "learning"
+        return readback
+
+    def set_camera_controls(self, controls: dict, save: bool = True) -> dict:
+        """Apply camera controls live, without reopening the camera."""
+        geometry_moved = sorted(
+            name for name, value in (controls or {}).items()
+            if name in GEOMETRY_CONTROLS
+            and float(value or 0) != float(self.config.camera.controls.get(name, 0))
+        )
+        with self._lock:
+            self.config.apply({"camera": {"controls": controls}})
+            readback = self._push_controls()
+            if save and self.config_path:
+                self.config.save(self.config_path)
+        result = {"controls": readback, "camera": self.camera_info(),
+                  "recalibrate": geometry_moved}
+        self.events.publish("camera", recalibrate=geometry_moved)
+        return result
+
+    def camera_info(self) -> dict:
+        """What the camera is actually doing, plus every control it exposes."""
+        with self._lock:
+            source = self._source
+            requested = dict(self.config.camera.controls)
+        if source is None or not hasattr(source, "describe"):
+            return {"open": False, "demo": isinstance(source, DemoSource),
+                    "controls": {}, "actual": {}}
+        return {"open": True, "demo": False, "actual": source.describe(),
+                "controls": source.read_controls(requested)}
 
     def _new_game(self) -> None:
         g = self.config.game
@@ -404,8 +438,17 @@ class ScoringEngine:
         self._log_file.flush()
 
     def _publish_frame(self, frame) -> None:
-        if self._viewers <= 0 and time.time() - self._last_pull > 5.0:
+        now = time.time()
+        if self._viewers <= 0 and now - self._last_pull > 5.0:
             return                                   # nobody is watching
+        # Publishing every captured frame gives the smoothest result, because
+        # the camera's own pacing is regular. A cap is available for narrow
+        # links, at the cost of an uneven beat when it does not divide the
+        # capture rate.
+        cap = self.config.camera.stream_fps
+        if cap and now - self._last_publish < 1.0 / cap:
+            return
+        self._last_publish = now
         jpeg = self._encode(self._annotate(frame))
         if jpeg is None:
             return
@@ -433,6 +476,8 @@ class ScoringEngine:
                         self._state = "learning" if self.calibration else "no calibration"
                         if self.detector:
                             self.detector.reset_background()
+                        if self.config.camera.controls:
+                            self._push_controls()
                 if self._source is None:
                     self.events.publish("state", state="no camera", error=self._error)
                     time.sleep(2.0)

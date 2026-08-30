@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 
 from . import geometry as geo
-from .calibration import CANON_SIZE, PX_PER_MM, board_to_canon
+from .calibration import CANON_CENTRE, CANON_SIZE, PX_PER_MM, board_to_canon
 
 BLACK = (28, 28, 28)
 CREAM = (196, 222, 236)
@@ -65,28 +65,65 @@ def render_board(size: int = CANON_SIZE) -> np.ndarray:
     return img
 
 
+RING_RADII = (geo.R_OUTER_BULL, geo.R_TRIPLE_IN, geo.R_TRIPLE_OUT,
+              geo.R_DOUBLE_IN, geo.R_DOUBLE_OUT)
+_RING_STEPS = 181
+
+
+def _project_mm(calib, points_mm):
+    """Board millimetres -> image pixels, in one batched transform."""
+    canon = np.asarray(points_mm, dtype=np.float32) * PX_PER_MM + np.float32(CANON_CENTRE)
+    return calib.to_image(canon)
+
+
+def _overlay_geometry(calib):
+    """Rings, wires and number positions in image pixels.
+
+    Cached on the calibration object: the board does not move between frames,
+    so projecting it again every frame is pure waste. Projecting the ~950
+    points one at a time costs ~10 ms; batched into three calls it is ~0.2 ms,
+    and cached it is free. A Calibration is replaced wholesale whenever the
+    landmarks change, so the cache invalidates itself.
+    """
+    cached = getattr(calib, "_overlay_geometry", None)
+    if cached is not None:
+        return cached
+
+    angles = np.linspace(0.0, 360.0, _RING_STEPS)
+    rings_mm = np.array([geo.polar_to_board(r, t) for r in RING_RADII for t in angles])
+    rings = _project_mm(calib, rings_mm).reshape(len(RING_RADII), _RING_STEPS, 2)
+    rings = [np.round(r).astype(np.int32).reshape(-1, 1, 2) for r in rings]
+
+    wire_angles = [geo.SECTOR_ORIGIN_DEG - i * geo.SECTOR_DEG for i in range(20)]
+    wires_mm = np.array(
+        [geo.polar_to_board(r, a) for a in wire_angles
+         for r in (geo.R_OUTER_BULL, geo.R_DOUBLE_OUT)])
+    wires = np.round(_project_mm(calib, wires_mm)).astype(np.int32).reshape(20, 2, 2)
+
+    label_mm = np.array([
+        geo.polar_to_board(geo.R_DOUBLE_OUT + 18,
+                           geo.SECTOR_ORIGIN_DEG - (i + 0.5) * geo.SECTOR_DEG)
+        for i in range(20)])
+    label_xy = np.round(_project_mm(calib, label_mm)).astype(np.int32)
+    labels = [(str(bed), (int(x) - 10, int(y) + 5))
+              for bed, (x, y) in zip(geo.SECTORS, label_xy)]
+
+    geometry = (rings, wires, labels)
+    calib._overlay_geometry = geometry
+    return geometry
+
+
 def draw_board_overlay(frame, calib, colour=(0, 220, 255), thickness=1):
     """Project the board's rings and wires back onto the camera image - the
     quickest way to eyeball whether a calibration is any good."""
-    def project(points_mm):
-        pts = [calib.board_mm_to_image(x, y) for x, y in points_mm]
-        return np.array(pts, dtype=np.int32).reshape(-1, 1, 2)
-
-    ts = np.linspace(0, 360, 181)
-    for r in (geo.R_OUTER_BULL, geo.R_TRIPLE_IN, geo.R_TRIPLE_OUT,
-              geo.R_DOUBLE_IN, geo.R_DOUBLE_OUT):
-        ring = [geo.polar_to_board(r, t) for t in ts]
-        cv2.polylines(frame, [project(ring)], True, colour, thickness, cv2.LINE_AA)
-    for idx in range(20):
-        a = geo.SECTOR_ORIGIN_DEG - idx * geo.SECTOR_DEG
-        seg = [geo.polar_to_board(geo.R_OUTER_BULL, a),
-               geo.polar_to_board(geo.R_DOUBLE_OUT, a)]
-        cv2.polylines(frame, [project(seg)], False, colour, thickness, cv2.LINE_AA)
-    for idx, bed in enumerate(geo.SECTORS):
-        a = geo.SECTOR_ORIGIN_DEG - (idx + 0.5) * geo.SECTOR_DEG
-        x, y = calib.board_mm_to_image(*geo.polar_to_board(geo.R_DOUBLE_OUT + 18, a))
-        cv2.putText(frame, str(bed), (int(x) - 10, int(y) + 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, colour, 1, cv2.LINE_AA)
+    rings, wires, labels = _overlay_geometry(calib)
+    cv2.polylines(frame, rings, True, colour, thickness, cv2.LINE_AA)
+    for (x0, y0), (x1, y1) in wires:
+        cv2.line(frame, (int(x0), int(y0)), (int(x1), int(y1)),
+                 colour, thickness, cv2.LINE_AA)
+    for text, origin in labels:
+        cv2.putText(frame, text, origin, cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45, colour, 1, cv2.LINE_AA)
     return frame
 
 

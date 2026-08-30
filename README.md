@@ -86,6 +86,7 @@ script prefers it already. Drop `stream_scale` to 0.5 and `stream_quality` to
 | `GET /api/events` | server-sent events: darts, state changes |
 | `GET`/`POST /api/config` | read or change any setting |
 | `GET`/`POST`/`DELETE /api/calibration` | the board landmarks |
+| `GET`/`POST /api/camera` | what the camera is doing; focus, zoom, exposure, ... |
 | `POST /api/calibration/auto`, `/preview` | suggested landmarks; overlay preview |
 | `POST /api/command` | `undo`, `end_turn`, `new_game`, `relearn`, `reconnect`, `throw` |
 | `GET /api/throws.csv` | every detection, logged |
@@ -137,6 +138,39 @@ Each dart carries a confidence, knocked down when the blob is not dart-shaped,
 when it lands off the scoring area, or when it lands within a wire's width of a
 boundary. Low-confidence calls are marked in amber - those are the ones to check.
 
+## Camera settings
+
+Open **Camera controls** under the video. Every row shows what the camera
+*actually* reports after a change, because cameras routinely accept a value and
+then ignore or clamp it - if the reading does not move, that camera does not
+support that control. Blank a box to stop setting it at all.
+
+- **Lock focus & white balance** freezes the lens where it is. Do this before
+  scoring: autofocus hunts, which pulses the picture and, worse, shifts the
+  reference frame the detector compares against, producing phantom darts.
+- **Zoom, pan and tilt move the board within the frame**, so they invalidate the
+  calibration. The UI says so when you change one; calibrate again afterwards.
+- Auto-exposure is worth turning off for the same reason as autofocus. Its
+  manual value is backend-specific (often `1` on V4L2, `0.25` on DirectShow),
+  which is why the box takes a number rather than a checkbox.
+
+Capture settings live in Settings:
+
+| setting | default | what it does |
+|---|---|---|
+| pixel format | MJPG | see below - the single biggest cause of a stuttering feed |
+| capture fps | 0 | 0 leaves the camera's own rate alone |
+| backend | auto | dshow on Windows, v4l2 on Linux, avfoundation on macOS |
+| buffer depth | 1 | 1 = always the newest frame, never a queued one |
+| stream fps cap | 0 | 0 publishes every captured frame, which is smoothest |
+
+**If the video is jittery**, check the pill at the top of Camera controls: it
+reports the resolution, rate, pixel format and backend the camera settled on. It
+is green only when MJPG is active. Most USB webcams offer uncompressed YUY2 and
+compressed MJPG, and OpenCV takes whatever the driver lists first - usually
+YUY2. Uncompressed 720p does not fit down USB 2.0 at 30 fps, so the camera
+quietly drops to 5-10 fps. Asking for MJPG is normally the whole fix.
+
 ## Tuning
 
 Defaults suit a 1280x720 webcam a metre or so from the board. All of it is in
@@ -162,6 +196,7 @@ darts stand out from the face of the board.
 python -m dart_scorer selftest    # synthetic throws through the whole pipeline
 python tests/test_geometry.py     # scoring geometry
 python tests/test_session.py      # visits, busts, checkouts, undo
+python tests/test_camera.py       # capture layer: drain thread, controls
 python tests/test_webapp.py       # the live service, end to end, no camera
 ```
 
@@ -189,6 +224,7 @@ dart_scorer/
   calibration.py  camera <-> board homography, save/load, board outline finder
   detector.py     background differencing, settle logic, tip estimation
   session.py      visits, 3-dart turns, X01 with double-out
+  camera.py       opening a camera: pixel format, drain thread, focus/zoom/...
   engine.py       the scoring thread: camera, detection, state, events
   webapp.py       HTTP routes, MJPEG stream, server-sent events
   web/index.html  the browser interface
@@ -201,6 +237,7 @@ deploy/
   install.sh               one-shot installer
   nginx-dart-scorer.conf   optional reverse proxy
 tests/
+  test_geometry.py  test_session.py  test_camera.py  test_webapp.py
 ```
 
 `board.png` is a reference render of the canonical board; `example_overlay.png`

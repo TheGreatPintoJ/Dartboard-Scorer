@@ -57,7 +57,14 @@ class Calibration:
 
     @property
     def H_inv(self) -> np.ndarray:
-        return np.linalg.inv(self.H)
+        # Cached: this is on the per-frame drawing path. A Calibration is
+        # replaced wholesale when the landmarks change, never edited in place,
+        # so the cache cannot go stale.
+        inv = getattr(self, "_H_inv", None)
+        if inv is None:
+            inv = np.linalg.inv(self.H)
+            object.__setattr__(self, "_H_inv", inv)
+        return inv
 
     # -- construction ------------------------------------------------------
     @classmethod

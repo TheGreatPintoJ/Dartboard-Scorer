@@ -14,8 +14,19 @@ class CameraConfig:
     source: str = "0"          # camera index, video file, URL, or "demo"
     width: int = 1280
     height: int = 720
+    # MJPG rather than the usual YUY2 default: uncompressed 720p does not fit
+    # down USB 2.0 at 30 fps, so the camera silently drops to 5-10 and the feed
+    # looks broken. Blank leaves the driver's choice alone.
+    fourcc: str = "MJPG"
+    fps: int = 0               # 0 = whatever the camera offers
+    backend: str = "auto"      # auto | any | dshow | msmf | v4l2 | avfoundation
+    buffer_size: int = 1       # 1 = always read the newest frame, never a queued one
     stream_quality: int = 75   # JPEG quality for the browser stream
     stream_scale: float = 1.0  # shrink the stream to save bandwidth
+    stream_fps: int = 0        # 0 = publish every captured frame (smoothest)
+    # Only the controls present here are pushed at the camera; anything absent
+    # is left exactly as the camera had it.
+    controls: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -59,10 +70,11 @@ class AppConfig:
     def apply(self, patch: dict) -> list[str]:
         """Merge a (possibly partial) dict in.
 
-        Returns only the sections whose values actually *changed* - the web UI
-        submits the whole form every time, and reopening the camera or
-        restarting the game because someone nudged an unrelated slider would be
-        maddening.
+        Returns the dotted names of the values that actually *changed*
+        ("camera.focus", "game.start_score"). The web UI submits the whole form
+        every time, and reopening the camera or restarting the game because
+        someone nudged an unrelated slider would be maddening - so callers act
+        on precisely what moved.
         """
         changed = []
         sections = {"camera": self.camera, "detector": self.detector, "game": self.game}
@@ -70,7 +82,6 @@ class AppConfig:
             if key in sections and isinstance(value, dict):
                 section = sections[key]
                 allowed = {f.name for f in fields(section)}
-                dirty = False
                 for name, raw in value.items():
                     if name not in allowed:
                         continue
@@ -78,9 +89,7 @@ class AppConfig:
                     new = _coerce(current, raw)
                     if new != current:
                         setattr(section, name, new)
-                        dirty = True
-                if dirty:
-                    changed.append(key)
+                        changed.append(f"{key}.{name}")
             elif key in ("calibration_path", "log_path") and isinstance(value, str):
                 if getattr(self, key) != value:
                     setattr(self, key, value)
@@ -100,6 +109,17 @@ class AppConfig:
 
 def _coerce(current, raw):
     """Keep the declared type - the browser sends everything as strings."""
+    if isinstance(current, dict):
+        # Merge rather than replace, so setting one camera control does not
+        # wipe the rest. An explicit null removes a control (back to "leave
+        # whatever the camera had").
+        merged = dict(current)
+        for key, value in (raw or {}).items():
+            if value is None or value == "":
+                merged.pop(key, None)
+            else:
+                merged[key] = float(value)
+        return merged
     if isinstance(current, bool):
         if isinstance(raw, str):
             return raw.strip().lower() in ("1", "true", "yes", "on")

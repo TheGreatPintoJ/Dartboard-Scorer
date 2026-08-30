@@ -84,6 +84,14 @@
   details summary { cursor: pointer; color: var(--muted); font-size: 13px;
                     text-transform: uppercase; letter-spacing: .08em; font-weight: 600; }
   details[open] summary { margin-bottom: 12px; }
+  .controls { margin-top: 12px; }
+  .ctl { display: grid; grid-template-columns: 1fr 120px 62px auto; gap: 10px;
+         align-items: center; padding: 5px 0; border-bottom: 1px solid var(--line); }
+  .ctl-name { font-size: 13px; }
+  .ctl-read { font-size: 12px; color: var(--muted); text-align: right;
+              font-variant-numeric: tabular-nums; }
+  .ctl.unsupported { opacity: .45; }
+  .ctl input[type=checkbox] { justify-self: start; width: auto; }
   .toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
            background: #2f3540; border: 1px solid var(--line); padding: 9px 16px;
            border-radius: 9px; opacity: 0; transition: opacity .25s; z-index: 9; }
@@ -122,6 +130,28 @@
         Point a camera at the board, then calibrate once. It stays valid until
         the camera moves.
       </p>
+    </div>
+
+    <div class="card" id="camera-card">
+      <details id="camera-details">
+        <summary>Camera controls</summary>
+        <div class="row" style="margin-top:12px">
+          <span class="pill" id="cam-actual">not open</span>
+          <button id="btn-cam-refresh">Refresh</button>
+          <button id="btn-lock-focus">Lock focus &amp; white balance</button>
+        </div>
+        <p class="hint" id="cam-warn" hidden></p>
+        <div id="controls" class="controls"></div>
+        <p class="hint">
+          Ranges are camera-specific and unlabelled by the driver, so each row
+          shows what the camera <b>actually</b> reports after the change - if it
+          does not move, that camera does not support it. Blank a box to stop
+          setting that control at all.
+          <b>Autofocus and auto-exposure should be off</b> while scoring: both
+          hunt, which pulses the picture and shifts the reference frame the
+          detector compares against.
+        </p>
+      </details>
     </div>
 
     <div class="card" id="demo-card" hidden>
@@ -174,10 +204,27 @@
             <input id="cfg-source" placeholder="0, /dev/video0, URL, demo"></label>
           <label class="field">Width <input id="cfg-width" type="number"></label>
           <label class="field">Height <input id="cfg-height" type="number"></label>
+          <label class="field">Pixel format (MJPG for smooth 720p)
+            <input id="cfg-fourcc" placeholder="MJPG"></label>
+          <label class="field">Capture fps (0 = camera default)
+            <input id="cfg-fps" type="number" min="0" max="120"></label>
+          <label class="field">Backend
+            <select id="cfg-backend">
+              <option value="auto">auto</option>
+              <option value="dshow">dshow (Windows)</option>
+              <option value="msmf">msmf (Windows)</option>
+              <option value="v4l2">v4l2 (Linux)</option>
+              <option value="avfoundation">avfoundation (macOS)</option>
+              <option value="any">any</option>
+            </select></label>
+          <label class="field">Buffer depth (1 = newest frame)
+            <input id="cfg-buffer" type="number" min="1" max="8"></label>
           <label class="field">Stream quality
             <input id="cfg-quality" type="number" min="20" max="95"></label>
           <label class="field">Stream scale
             <input id="cfg-scale" type="number" step="0.1" min="0.2" max="1"></label>
+          <label class="field">Stream fps cap (0 = every frame)
+            <input id="cfg-streamfps" type="number" min="0" max="60"></label>
         </div>
         <div class="row"><button id="btn-cameras">Find cameras</button>
           <span class="pill" id="cameras">-</span></div>
@@ -397,6 +444,100 @@ $("btn-rectified").onclick = () => {
   toast("Flat view - press again for live video");
 };
 
+/* ------------------------------------------------------ camera controls */
+const CONTROL_LABELS = {
+  autofocus: ["Autofocus", "toggle"],
+  focus: ["Focus", "number"],
+  zoom: ["Zoom", "number"],
+  auto_exposure: ["Auto exposure", "number"],
+  exposure: ["Exposure", "number"],
+  gain: ["Gain", "number"],
+  brightness: ["Brightness", "number"],
+  contrast: ["Contrast", "number"],
+  saturation: ["Saturation", "number"],
+  sharpness: ["Sharpness", "number"],
+  auto_wb: ["Auto white balance", "toggle"],
+  wb_temperature: ["White balance K", "number"],
+  pan: ["Pan", "number"],
+  tilt: ["Tilt", "number"],
+  backlight: ["Backlight compensation", "number"],
+};
+// Moving these moves the board within the frame, which invalidates the
+// homography - the operator has to be told.
+const GEOMETRY_CONTROLS = ["zoom", "pan", "tilt"];
+let cameraInfo = null;
+
+function renderCamera(info) {
+  cameraInfo = info;
+  const actual = info.actual || {};
+  $("cam-actual").textContent = info.demo ? "demo board"
+    : !info.open ? "not open"
+    : `${actual.width}x${actual.height} @ ${actual.fps} fps · ${actual.fourcc || "?"}`
+      + ` · ${actual.backend} · buffer ${actual.buffer_size}`;
+  $("cam-actual").className = "pill " + (info.open && actual.fourcc === "MJPG" ? "ok" : "warn");
+
+  const box = $("controls");
+  box.innerHTML = "";
+  for (const [name, [label, kind]] of Object.entries(CONTROL_LABELS)) {
+    const c = (info.controls || {})[name];
+    if (!c) continue;
+    const row = document.createElement("div");
+    row.className = "ctl" + (c.supported ? "" : " unsupported");
+    const value = c.requested ?? "";
+    const input = kind === "toggle"
+      ? `<input type="checkbox" data-ctl="${name}" ${Number(c.actual) > 0 ? "checked" : ""}>`
+      : `<input type="number" step="any" data-ctl="${name}" value="${value}"
+                placeholder="${c.actual ?? ""}">`;
+    row.innerHTML = `<span class="ctl-name">${label}</span>${input}` +
+      `<span class="ctl-read" title="what the camera reports now">${c.actual ?? "-"}</span>` +
+      (c.supported ? "" : `<span class="pill">unsupported</span>`);
+    box.appendChild(row);
+  }
+  box.querySelectorAll("[data-ctl]").forEach((el) => {
+    el.onchange = () => {
+      const name = el.dataset.ctl;
+      const value = el.type === "checkbox" ? (el.checked ? 1 : 0)
+        : el.value === "" ? null : Number(el.value);
+      setControls({ [name]: value });
+    };
+  });
+}
+
+async function setControls(controls) {
+  try {
+    const result = await api("/api/camera",
+      { method: "POST", body: JSON.stringify({ controls }) });
+    renderCamera({ ...result.camera, controls: result.controls });
+    const warn = $("cam-warn");
+    if (result.recalibrate && result.recalibrate.length) {
+      warn.hidden = false;
+      warn.innerHTML = `<b>${result.recalibrate.join(", ")} changed - the board has ` +
+        `moved in the frame, so the calibration no longer matches. Calibrate again.</b>`;
+      toast("Zoom changed - recalibrate", true);
+    }
+    logLine("camera: " + Object.entries(controls)
+      .map(([k, v]) => `${k}=${v === null ? "auto" : v}`).join(", "));
+  } catch (err) { toast(err.message, true); }
+}
+
+async function loadCamera() {
+  try { renderCamera(await api("/api/camera")); }
+  catch (err) { toast(err.message, true); }
+}
+
+$("btn-cam-refresh").onclick = loadCamera;
+$("btn-lock-focus").onclick = () => {
+  // Freeze the lens where it currently is, rather than picking a number that
+  // means nothing on this camera.
+  const focus = cameraInfo?.controls?.focus?.actual;
+  const patch = { autofocus: 0, auto_wb: 0 };
+  if (focus != null && focus >= 0) patch.focus = focus;
+  setControls(patch);
+};
+$("camera-details").addEventListener("toggle", () => {
+  if ($("camera-details").open && !cameraInfo) loadCamera();
+});
+
 /* ------------------------------------------------------------- commands */
 async function command(name, extra = {}) {
   try { render(await api("/api/command",
@@ -425,8 +566,12 @@ $("btn-apply").onclick = async () => {
   const patch = {
     camera: {
       source: $("cfg-source").value, width: +$("cfg-width").value,
-      height: +$("cfg-height").value, stream_quality: +$("cfg-quality").value,
+      height: +$("cfg-height").value, fourcc: $("cfg-fourcc").value,
+      fps: +$("cfg-fps").value, backend: $("cfg-backend").value,
+      buffer_size: +$("cfg-buffer").value,
+      stream_quality: +$("cfg-quality").value,
       stream_scale: +$("cfg-scale").value,
+      stream_fps: +$("cfg-streamfps").value,
     },
     detector: {
       diff_threshold: +$("cfg-diff").value, min_area: +$("cfg-minarea").value,
@@ -456,6 +601,11 @@ function fillSettings(cfg) {
   $("cfg-source").value = cfg.camera.source;
   $("cfg-width").value = cfg.camera.width;
   $("cfg-height").value = cfg.camera.height;
+  $("cfg-fourcc").value = cfg.camera.fourcc;
+  $("cfg-fps").value = cfg.camera.fps;
+  $("cfg-backend").value = cfg.camera.backend;
+  $("cfg-buffer").value = cfg.camera.buffer_size;
+  $("cfg-streamfps").value = cfg.camera.stream_fps;
   $("cfg-quality").value = cfg.camera.stream_quality;
   $("cfg-scale").value = cfg.camera.stream_scale;
   $("cfg-diff").value = cfg.detector.diff_threshold;
@@ -543,6 +693,7 @@ function connect() {
       api("/api/status").then(render).catch(() => {});
     } else if (data.type === "config") {
       settingsTouched = false;
+      if (cameraInfo) loadCamera();
       api("/api/status").then(render).catch(() => {});
     }
   };

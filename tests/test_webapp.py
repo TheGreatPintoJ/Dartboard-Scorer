@@ -177,6 +177,59 @@ def test_config_coerces_browser_strings():
     post("/api/config", {"detector": {"settle_frames": 4}, "game": {"double_out": True}})
 
 
+def test_camera_endpoint_reports_controls():
+    info = get("/api/camera")
+    check("controls" in info, "the camera endpoint should list controls")
+    # The demo board has no real capture device behind it.
+    check(info["demo"] or info["open"], "it should say whether a camera is open")
+
+
+def test_camera_controls_are_rejected_when_empty():
+    try:
+        post("/api/camera", {"controls": {}})
+        raise AssertionError("an empty control set should be rejected")
+    except urllib.error.HTTPError as exc:
+        check(exc.code == 400, f"expected 400, got {exc.code}")
+
+
+def test_camera_controls_persist_in_config():
+    post("/api/camera", {"controls": {"focus": 30, "autofocus": 0}})
+    controls = get("/api/config")["camera"]["controls"]
+    check(controls.get("focus") == 30, f"focus should be stored, got {controls}")
+    check(controls.get("autofocus") == 0, "autofocus should be stored")
+
+    # Setting one control must not wipe the others.
+    post("/api/camera", {"controls": {"brightness": 128}})
+    controls = get("/api/config")["camera"]["controls"]
+    check(controls.get("focus") == 30, "focus should survive an unrelated change")
+    check(controls.get("brightness") == 128, "brightness should be stored")
+
+    # Blanking a control stops us setting it at all.
+    post("/api/camera", {"controls": {"focus": None}})
+    check("focus" not in get("/api/config")["camera"]["controls"],
+          "a null should remove the control")
+    post("/api/config", {"camera": {"controls": {"autofocus": None,
+                                                 "brightness": None}}})
+
+
+def test_zoom_change_warns_that_calibration_is_stale():
+    result = post("/api/camera", {"controls": {"zoom": 2}})
+    check(result["recalibrate"] == ["zoom"],
+          f"zoom moves the board in frame, expected a warning, got {result['recalibrate']}")
+    result = post("/api/camera", {"controls": {"brightness": 100}})
+    check(result["recalibrate"] == [], "brightness does not move the board")
+    post("/api/config", {"camera": {"controls": {"zoom": None, "brightness": None}}})
+
+
+def test_capture_settings_round_trip():
+    post("/api/config", {"camera": {"fourcc": "MJPG", "buffer_size": 1,
+                                    "backend": "auto", "stream_fps": 0}})
+    cam = get("/api/config")["camera"]
+    check(cam["fourcc"] == "MJPG", "MJPG is the default pixel format")
+    check(cam["buffer_size"] == 1, "buffer depth 1 keeps the newest frame")
+    check(cam["stream_fps"] == 0, "0 means publish every captured frame")
+
+
 def test_calibration_endpoints():
     points = get("/api/calibration")["points"]
     _, preview = post("/api/calibration/preview", {"points": points}, raw=True)
@@ -250,6 +303,11 @@ if __name__ == "__main__":
         test_undo_and_end_visit, test_pulling_darts_ends_the_visit,
         test_config_round_trip, test_unchanged_settings_do_not_disturb_the_game,
         test_config_coerces_browser_strings,
+        test_camera_endpoint_reports_controls,
+        test_camera_controls_are_rejected_when_empty,
+        test_camera_controls_persist_in_config,
+        test_zoom_change_warns_that_calibration_is_stale,
+        test_capture_settings_round_trip,
         test_calibration_endpoints, test_unknown_command_is_rejected,
         test_missing_route, test_token_is_enforced_when_set,
     ]

@@ -19,6 +19,34 @@ from . import render
 from .calibration import CANON_SIZE, Calibration, board_to_canon, reference_canon_points
 
 
+class SyntheticView:
+    """Turns the canonical board into what an off-axis camera would see.
+
+    The two halves are separate because they change at different rates: the
+    perspective warp only changes when a dart lands, while the sensor noise
+    must differ every frame. Drawing two million gaussian samples per frame
+    costs more than the whole scoring pipeline, so the noise is generated once
+    and cycled - otherwise the demo source looks like the pipeline is slow.
+    """
+
+    def __init__(self, H_cam, width, height, rng, pool=8):
+        self.H_cam = H_cam
+        self.size = (width, height)
+        self._noise = [rng.normal(0, 1.6, (height, width, 3)).astype(np.int16)
+                       for _ in range(pool)]
+        self._n = 0
+
+    def warp(self, canvas):
+        return cv2.warpPerspective(canvas, self.H_cam, self.size)
+
+    def noise(self, image):
+        self._n += 1
+        return cv2.add(image, self._noise[self._n % len(self._noise)], dtype=cv2.CV_8U)
+
+    def __call__(self, canvas):
+        return self.noise(self.warp(canvas))
+
+
 def synthetic_camera(width=960, height=720, skew=0.16, seed=7):
     """Return (board image, view function, the matching perfect calibration)."""
     rng = np.random.default_rng(seed)
@@ -34,10 +62,7 @@ def synthetic_camera(width=960, height=720, skew=0.16, seed=7):
     H_cam = cv2.getPerspectiveTransform(src, dst)          # canonical -> camera
     board = render.render_board()
 
-    def view(canvas):
-        img = cv2.warpPerspective(canvas, H_cam, (width, height))
-        noise = rng.normal(0, 1.6, img.shape).astype(np.float32)
-        return np.clip(img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+    view = SyntheticView(H_cam, width, height, rng)
 
     image_points = cv2.perspectiveTransform(
         reference_canon_points().reshape(-1, 1, 2), H_cam).reshape(-1, 2)
@@ -95,6 +120,8 @@ class DemoSource:
         self._next = 0.0
         self.name = "demo"
         self.darts: list[str] = []
+        self._dirty = True
+        self._warped: np.ndarray | None = None
 
     def read(self):
         now = time.monotonic()
@@ -102,7 +129,12 @@ class DemoSource:
             time.sleep(min(self._next - now, self._interval))
         self._next = max(now, self._next) + self._interval
         with self._lock:
-            return self._view(self._canvas)
+            # The board only changes when a dart lands or the darts come out,
+            # so the perspective warp is cached; only the noise is per frame.
+            if self._dirty or self._warped is None:
+                self._warped = self._view.warp(self._canvas)
+                self._dirty = False
+            return self._view.noise(self._warped)
 
     def throw(self, label: str, jitter_deg: float = 5.0) -> str:
         x, y = target_for_label(label)
@@ -110,14 +142,17 @@ class DemoSource:
             if len(self.darts) >= 3:
                 self._canvas = self._board.copy()
                 self.darts.clear()
+                self._dirty = True
             draw_dart_on_board(self._canvas, x, y, jitter_deg=jitter_deg)
             self.darts.append(label.upper())
+            self._dirty = True
         return label.upper()
 
     def clear(self) -> None:
         with self._lock:
             self._canvas = self._board.copy()
             self.darts.clear()
+            self._dirty = True
 
     def release(self) -> None:
         pass

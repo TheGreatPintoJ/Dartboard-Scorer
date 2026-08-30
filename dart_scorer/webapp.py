@@ -13,6 +13,8 @@ copying the tree and pointing systemd at it. Serves:
   /api/calibration          GET / POST / DELETE the board landmarks
   /api/calibration/auto     suggested landmarks from the board outline
   /api/calibration/preview  overlay rendered for candidate landmarks
+  /api/camera               GET what the camera is doing + every control it
+                            exposes; POST to change focus, zoom, exposure, ...
   /api/command              undo, end_turn, new_game, relearn, reconnect, throw
   /api/throws.csv           the detection log
   /healthz                  liveness probe
@@ -139,6 +141,8 @@ class Handler(BaseHTTPRequestHandler):
                                   "text/csv; charset=utf-8")
             if path == "/api/cameras":
                 return self._json({"cameras": probe_cameras()})
+            if path == "/api/camera":
+                return self._json(self.engine.camera_info())
         except BrokenPipeError:
             return
         except Exception as exc:                             # keep the service up
@@ -186,6 +190,12 @@ class Handler(BaseHTTPRequestHandler):
                                        "could not find the board - place the "
                                        "landmarks by hand")
                 return self._json({"points": points})
+
+            if path == "/api/camera":
+                controls = body.get("controls", body)
+                if not isinstance(controls, dict) or not controls:
+                    return self._error(HTTPStatus.BAD_REQUEST, "no controls given")
+                return self._json(self.engine.set_camera_controls(controls))
 
             if path == "/api/command":
                 name = body.get("command", "")
