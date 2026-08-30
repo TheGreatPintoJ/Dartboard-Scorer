@@ -470,11 +470,18 @@ let cameraInfo = null;
 function renderCamera(info) {
   cameraInfo = info;
   const actual = info.actual || {};
+  // Judge the camera on what the pipeline actually achieves, not on the pixel
+  // format: plenty of cameras run fine on NV12 or YUYV, and several drivers
+  // report -1 for properties they simply do not expose.
+  const measured = status?.fps ?? 0;
+  const na = (v) => (v === undefined || v === null || v < 0 ? "n/a" : v);
   $("cam-actual").textContent = info.demo ? "demo board"
     : !info.open ? "not open"
-    : `${actual.width}x${actual.height} @ ${actual.fps} fps · ${actual.fourcc || "?"}`
-      + ` · ${actual.backend} · buffer ${actual.buffer_size}`;
-  $("cam-actual").className = "pill " + (info.open && actual.fourcc === "MJPG" ? "ok" : "warn");
+    : `${actual.width}x${actual.height} · ${measured.toFixed(0)} fps measured`
+      + ` · ${actual.fourcc || "?"} · ${actual.backend}`
+      + ` · driver says ${na(actual.fps)} fps, buffer ${na(actual.buffer_size)}`;
+  $("cam-actual").className = "pill " + (info.demo || !info.open ? "warn"
+    : measured >= 15 ? "ok" : measured > 0 ? "warn" : "bad");
 
   const box = $("controls");
   box.innerHTML = "";

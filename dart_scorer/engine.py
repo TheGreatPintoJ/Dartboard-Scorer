@@ -80,7 +80,7 @@ class ScoringEngine:
         self._jpeg_seq = 0
         self._viewers = 0
         self._last_pull = 0.0
-        self._last_publish = 0.0
+        self._next_publish = 0.0
 
         self.calibration: Calibration | None = None
         self.detector: DartDetector | None = None
@@ -441,14 +441,20 @@ class ScoringEngine:
         now = time.time()
         if self._viewers <= 0 and now - self._last_pull > 5.0:
             return                                   # nobody is watching
-        # Publishing every captured frame gives the smoothest result, because
-        # the camera's own pacing is regular. A cap is available for narrow
-        # links, at the cost of an uneven beat when it does not divide the
-        # capture rate.
+        # Detection still runs on every captured frame; only what the browser
+        # is asked to decode is capped. Past ~25 fps the browser's MJPEG path
+        # is the bottleneck, not the camera or the encoder.
         cap = self.config.camera.stream_fps
-        if cap and now - self._last_publish < 1.0 / cap:
-            return
-        self._last_publish = now
+        if cap:
+            interval = 1.0 / cap
+            # Aim at a deadline that advances by a fixed step, and accept a
+            # frame that arrives slightly early. Comparing against "when did I
+            # last publish" instead makes any timing jitter push the decision
+            # onto the following captured frame, so a 60 fps camera capped at
+            # 20 delivers a lurching 15.
+            if now < self._next_publish - 0.25 * interval:
+                return
+            self._next_publish = max(now, self._next_publish) + interval
         jpeg = self._encode(self._annotate(frame))
         if jpeg is None:
             return

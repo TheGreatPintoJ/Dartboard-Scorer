@@ -393,6 +393,18 @@ def cmd_serve(args) -> int:
 
 
 # --------------------------------------------------------------------------- #
+def cmd_doctor(args) -> int:
+    """Work out which stage a jittery picture is coming from."""
+    from .diagnose import report
+
+    index = None if args.no_camera else (
+        int(args.source) if str(args.source).isdigit() else None)
+    if index is None and not args.no_camera:
+        print(f"skipping camera checks: {args.source!r} is not a camera index")
+    return report(index, args.url, args.token)
+
+
+# --------------------------------------------------------------------------- #
 def cmd_board(args) -> int:
     """Write out a reference image of the canonical board."""
     cv2.imwrite(args.out, render.render_board())
@@ -451,6 +463,15 @@ def build_parser() -> argparse.ArgumentParser:
                                    "the X-Auth-Token header")
     w.add_argument("--verbose", action="store_true", help="log every request")
     w.set_defaults(func=cmd_serve)
+
+    d = sub.add_parser("doctor", help="diagnose a jittery or slow picture")
+    d.add_argument("--source", default="0", help="camera index to test (default: 0)")
+    d.add_argument("--no-camera", action="store_true",
+                   help="skip the camera checks")
+    d.add_argument("--url", help="also measure a running server, "
+                                 "e.g. http://127.0.0.1:8080")
+    d.add_argument("--token", help="token, if the server needs one")
+    d.set_defaults(func=cmd_doctor)
 
     t = sub.add_parser("selftest", help="run the pipeline on synthetic throws")
     t.add_argument("--show", action="store_true", help="display each throw")

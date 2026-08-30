@@ -162,14 +162,65 @@ Capture settings live in Settings:
 | capture fps | 0 | 0 leaves the camera's own rate alone |
 | backend | auto | dshow on Windows, v4l2 on Linux, avfoundation on macOS |
 | buffer depth | 1 | 1 = always the newest frame, never a queued one |
-| stream fps cap | 0 | 0 publishes every captured frame, which is smoothest |
+| stream fps cap | 20 | what the browser is asked to decode; 0 = uncapped |
 
-**If the video is jittery**, check the pill at the top of Camera controls: it
-reports the resolution, rate, pixel format and backend the camera settled on. It
-is green only when MJPG is active. Most USB webcams offer uncompressed YUY2 and
-compressed MJPG, and OpenCV takes whatever the driver lists first - usually
-YUY2. Uncompressed 720p does not fit down USB 2.0 at 30 fps, so the camera
-quietly drops to 5-10 fps. Asking for MJPG is normally the whole fix.
+## If the picture is jittery
+
+Run the doctor. It measures each stage separately, because the camera, this
+machine, the server and the browser fail differently and need different fixes:
+
+```bash
+python -m dart_scorer doctor --source 0 --url http://127.0.0.1:8080
+```
+
+It reports what this machine can process per frame, what the camera delivers at
+each resolution and pixel format, and what the running server actually serves -
+including a **horizontal wrap check**. Frames read from the buffer at the wrong
+offset come out shifted sideways with the content wrapping around the edge;
+comparing consecutive frames of a still scene by circular cross-correlation
+finds it. A healthy camera scores 0.
+
+Then work down this list:
+
+1. **If the doctor says the camera never exceeds ~10 fps**, it is the pixel
+   format. Most USB webcams offer uncompressed YUY2 and compressed MJPG, and
+   OpenCV takes whatever the driver lists first - usually YUY2, which does not
+   fit down USB 2.0 at 720p, so the camera quietly drops to 5-10 fps. Set the
+   pixel format to MJPG in Settings.
+2. **If the doctor says the camera returns wrapped frames**, that is a driver or
+   cable problem: update the camera driver, use a different USB port, and avoid
+   hubs.
+3. **If the doctor says the served stream is clean and steady but the picture on
+   screen is not**, the fault is past the socket and no change to this program
+   will fix it. See below.
+
+### When the stream is clean but the screen is not
+
+A browser renders an MJPEG stream through the GPU compositor, and that path can
+tear, stall or wrap even when every byte arriving is correct. To tell the
+difference:
+
+- Open `http://<host>:8080/stream.mjpg` **directly** in a tab, with no page
+  around it. If that is smooth, the problem is the page or the compositor rather
+  than the stream.
+- Compare what you see with what a screen recording shows. If your eyes see
+  smooth video and only the recording is torn, the recorder is at fault - it is
+  capturing a hardware surface - and there is nothing to fix.
+
+If it really is on screen:
+
+- **Turn off browser hardware acceleration.** Chrome and Edge:
+  `chrome://settings/system` / `edge://settings/system`, uncheck "Use graphics
+  acceleration when available", restart the browser. This is the usual fix for a
+  torn or sideways-wrapped video surface.
+- **Try another browser.** Firefox and Chromium handle MJPEG differently.
+- **Update the GPU driver.** Stride and offset bugs in the compositor are driver
+  bugs.
+- **Close anything else using the camera** - OBS, Teams, Zoom. Windows shares a
+  camera between applications through its Frame Server, and the format can be
+  renegotiated underneath a running capture.
+- **Lower the stream fps cap** in Settings. The default is 20; a browser decodes
+  that comfortably, where 60 full-size JPEGs a second stalls and batches.
 
 ## Tuning
 
@@ -196,6 +247,7 @@ darts stand out from the face of the board.
 python -m dart_scorer selftest    # synthetic throws through the whole pipeline
 python tests/test_geometry.py     # scoring geometry
 python tests/test_session.py      # visits, busts, checkouts, undo
+python -m dart_scorer doctor      # camera, machine and stream diagnostics
 python tests/test_camera.py       # capture layer: drain thread, controls
 python tests/test_webapp.py       # the live service, end to end, no camera
 ```
@@ -225,6 +277,7 @@ dart_scorer/
   detector.py     background differencing, settle logic, tip estimation
   session.py      visits, 3-dart turns, X01 with double-out
   camera.py       opening a camera: pixel format, drain thread, focus/zoom/...
+  diagnose.py     the doctor: per-stage timing, wrap detection, verdicts
   engine.py       the scoring thread: camera, detection, state, events
   webapp.py       HTTP routes, MJPEG stream, server-sent events
   web/index.html  the browser interface

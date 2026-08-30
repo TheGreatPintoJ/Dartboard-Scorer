@@ -23,7 +23,12 @@ class CameraConfig:
     buffer_size: int = 1       # 1 = always read the newest frame, never a queued one
     stream_quality: int = 75   # JPEG quality for the browser stream
     stream_scale: float = 1.0  # shrink the stream to save bandwidth
-    stream_fps: int = 0        # 0 = publish every captured frame (smoothest)
+    # Cap what we push at the browser. A dartboard does not need 60 fps, and
+    # an <img multipart/x-mixed-replace> decoding 60 full-size JPEGs a second
+    # stalls, batches and tears - which looks exactly like a jittery camera
+    # even when the capture and the server are both perfectly smooth.
+    # 0 = uncapped, which is only sensible for a camera at 30 fps or below.
+    stream_fps: int = 20
     # Only the controls present here are pushed at the camera; anything absent
     # is left exactly as the camera had it.
     controls: dict = field(default_factory=dict)
