@@ -173,9 +173,10 @@ machine, the server and the browser fail differently and need different fixes:
 python -m dart_scorer doctor --source 0 --url http://127.0.0.1:8080
 ```
 
-It reports what this machine can process per frame, what the camera delivers at
-each resolution and pixel format, and what the running server actually serves -
-including a **horizontal wrap check**. Frames read from the buffer at the wrong
+It reports what this machine can process per frame at each resolution, what the
+camera delivers at each resolution and pixel format, what the two can manage
+*together* - and then recommends a configuration. It also measures what a
+running server actually serves, including a **horizontal wrap check**. Frames read from the buffer at the wrong
 offset come out shifted sideways with the content wrapping around the edge;
 comparing consecutive frames of a still scene by circular cross-correlation
 finds it. A healthy camera scores 0.
@@ -190,7 +191,15 @@ Then work down this list:
 2. **If the doctor says the camera returns wrapped frames**, that is a driver or
    cable problem: update the camera driver, use a different USB port, and avoid
    hubs.
-3. **If the doctor says the served stream is clean and steady but the picture on
+3. **If the doctor's "achievable" table says the machine is the limit**, this
+   machine cannot process that resolution fast enough and nothing else matters
+   until you lower it. Detection is the largest cost and it scales with pixel
+   count: 640x480 is a quarter of the work of 1280x720 and loses very little
+   accuracy - the tip is still found to within a couple of millimetres, against
+   an 8 mm treble ring. Dropping **stream scale** to 0.5 cuts the JPEG encoding
+   too, which on a slow machine is often the second biggest cost.
+   Recalibrate after changing the resolution.
+4. **If the doctor says the served stream is clean and steady but the picture on
    screen is not**, the fault is past the socket and no change to this program
    will fix it. See below.
 

@@ -105,8 +105,13 @@ class DartDetector:
     # ------------------------------------------------------------------ #
     @staticmethod
     def _prepare(frame) -> np.ndarray:
+        # Deliberately uint8, not float32. Every operation downstream of this
+        # is a difference, a threshold or a blur, all of which OpenCV runs with
+        # SIMD on 8-bit data; promoting to float doubles the memory traffic for
+        # no accuracy that matters at a 26-level threshold. On a slow machine
+        # this is the difference between keeping up with the camera and not.
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        return cv2.GaussianBlur(gray, (5, 5), 0).astype(np.float32)
+        return cv2.GaussianBlur(gray, (5, 5), 0)
 
     def _region_of_interest(self, shape) -> np.ndarray:
         """Everything outside the board (walls, the thrower) is ignored."""
@@ -123,7 +128,7 @@ class DartDetector:
 
     def _mask_against(self, gray, reference) -> tuple[np.ndarray, int]:
         diff = cv2.absdiff(gray, reference)
-        mask = (diff > self.diff_threshold).astype(np.uint8) * 255
+        _, mask = cv2.threshold(diff, self.diff_threshold, 255, cv2.THRESH_BINARY)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self._kernel, iterations=1)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._kernel, iterations=2)
         mask = cv2.bitwise_and(mask, self._region_of_interest(mask.shape))
@@ -151,8 +156,10 @@ class DartDetector:
         if self._prev is None:
             motion = 0.0
         else:
-            changed = cv2.absdiff(gray, self._prev) > self.diff_threshold
-            motion = float(np.count_nonzero(changed))
+            changed = cv2.absdiff(gray, self._prev)
+            _, changed = cv2.threshold(changed, self.diff_threshold, 255,
+                                       cv2.THRESH_BINARY)
+            motion = float(cv2.countNonZero(changed))
         self._prev = gray
 
         # --- learn the empty board ------------------------------------- #

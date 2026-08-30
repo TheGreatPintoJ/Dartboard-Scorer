@@ -60,7 +60,7 @@ def probe_camera(index: int, backend: str | None = None, frames: int = 40) -> li
     name = backend or default_backend()
     api = BACKENDS.get(name, cv2.CAP_ANY)
     results = []
-    for width, height in ((640, 480), (1280, 720), (1920, 1080)):
+    for width, height in RESOLUTIONS:
         for code in ("", "MJPG"):
             cap = cv2.VideoCapture(index, api)
             if not cap.isOpened():
@@ -95,6 +95,9 @@ def probe_camera(index: int, backend: str | None = None, frames: int = 40) -> li
     return results
 
 
+RESOLUTIONS = ((640, 480), (1280, 720), (1920, 1080))
+
+
 def probe_pipeline(width=1280, height=720) -> dict:
     """How long this machine takes to detect, annotate and encode one frame."""
     board, view, calib = synthetic_camera(width, height)
@@ -125,7 +128,12 @@ def probe_stream(url: str, seconds: float = 8.0, token: str | None = None) -> di
         url = url.rstrip("/") + "/stream.mjpg"
     if token:
         url += ("&" if "?" in url else "?") + "token=" + token
-    response = urllib.request.urlopen(url, timeout=20)
+    try:
+        response = urllib.request.urlopen(url, timeout=20)
+    except Exception as exc:
+        # A diagnostic tool that dies with a traceback when the thing it is
+        # diagnosing is not running is not much of a diagnostic tool.
+        return {"error": f"could not reach {url}: {exc}"}
     buffer = b""
     jpegs, times = [], []
     start = time.perf_counter()
@@ -169,20 +177,26 @@ def report(index: int | None, url: str | None, token: str | None = None) -> int:
     verdicts = []
 
     print("== this machine ==")
-    pipeline = probe_pipeline()
-    print(f"  detect {pipeline['detect_ms']}ms + overlay {pipeline['overlay_ms']}ms "
-          f"+ encode {pipeline['encode_ms']}ms = {pipeline['total_ms']}ms per frame")
-    print(f"  ceiling: {pipeline['ceiling_fps']} fps at 1280x720")
-    if pipeline["ceiling_fps"] < 25:
-        verdicts.append("This machine cannot process 25 fps at 720p. Lower the "
-                        "resolution, or accept a lower rate.")
+    machine = {}
+    for width, height in RESOLUTIONS:
+        p = probe_pipeline(width, height)
+        machine[(width, height)] = p
+        print(f"  {width}x{height}: detect {p['detect_ms']:6.2f} + overlay "
+              f"{p['overlay_ms']:5.2f} + encode {p['encode_ms']:6.2f} = "
+              f"{p['total_ms']:6.2f} ms  ->  {p['ceiling_fps']:5.1f} fps ceiling")
+    if machine[(1280, 720)]["ceiling_fps"] < 15:
+        verdicts.append(
+            f"This machine manages only {machine[(1280, 720)]['ceiling_fps']} fps at "
+            "720p. That alone caps the feed - the browser and the camera are not "
+            "the problem. Use a lower resolution (see the recommendation below).")
 
+    camera_rows = []
     if index is not None:
         print(f"\n== camera {index} ==")
         print(f"  {'requested':24s} {'got':11s} {'fourcc':7s} {'fps':>6s} "
               f"{'wrapped':>9s} {'max shift':>10s}")
-        best = 0.0
         clean = True
+        fell_back = False
         for row in probe_camera(index):
             if "error" in row:
                 print(f"  {row['requested']:24s} {row['error']}")
@@ -190,20 +204,69 @@ def report(index: int | None, url: str | None, token: str | None = None) -> int:
             wrapped = f"{row['wrapped']}/{row['of']}"
             print(f"  {row['requested']:24s} {row['got']:11s} {row['fourcc']:7s} "
                   f"{row['fps']:6.1f} {wrapped:>9s} {row['max_shift']:10d}")
-            best = max(best, row["fps"])
+            camera_rows.append(row)
             clean = clean and row["wrapped"] == 0
-        if best < 20:
-            verdicts.append(f"The camera never exceeded {best:.0f} fps. Try the MJPG "
-                            "row above, or a lower resolution.")
+            fell_back = fell_back or not row["requested"].startswith(row["got"])
+        if fell_back:
+            verdicts.append(
+                "The camera silently gave a smaller picture than asked for on some "
+                "rows above - it cannot do that size in that format. Keep the pixel "
+                "format on MJPG, which is what makes the larger sizes available.")
         if not clean:
             verdicts.append("The camera returned misaligned frames. Update the camera "
                             "driver, try another USB port, and avoid USB hubs.")
+
+    # What can this camera and this machine actually manage together?
+    if camera_rows:
+        print("\n== achievable, camera and machine together ==")
+        candidates = []
+        for row in camera_rows:
+            got = tuple(int(v) for v in row["got"].split("x"))
+            if got not in machine:
+                continue
+            achievable = min(row["fps"], machine[got]["ceiling_fps"])
+            limit = "camera" if row["fps"] < machine[got]["ceiling_fps"] else "machine"
+            print(f"  {row['requested']:24s} -> {achievable:5.1f} fps "
+                  f"(limited by the {limit})")
+            candidates.append((achievable, row, got))
+
+        # Enough frames to settle on beats extra pixels, but past 720p the extra
+        # pixels buy no useful accuracy - the tip is already found to ~1.5 mm.
+        target_fps, enough_pixels = 15.0, 1280 * 720
+
+        def rank(item):
+            achievable, _row, got = item
+            pixels = min(got[0] * got[1], enough_pixels)
+            return (achievable >= target_fps, pixels, achievable)
+
+        if candidates:
+            achievable, row, got = max(candidates, key=rank)
+            asked_for_mjpg = row["requested"].endswith("MJPG")
+            fmt = "MJPG" if asked_for_mjpg else f"blank, the driver default ({row['fourcc']})"
+            verdicts.append(
+                f"Best configuration here: {row['got']} with the pixel format set to "
+                f"{fmt} -> about {achievable:.0f} fps. Set width, height and pixel "
+                "format in Settings to match, then calibrate again: changing the "
+                "resolution moves every pixel, so the saved calibration no longer fits.")
+            if achievable < 10:
+                verdicts.append(
+                    "Even at its best this setup manages under 10 fps. Darts will "
+                    "still score - detection only needs the board to hold still - "
+                    "but the live picture will never look smooth on this machine.")
+            if machine[got]["encode_ms"] > machine[got]["total_ms"] * 0.35:
+                verdicts.append(
+                    "JPEG encoding is a large share of the frame time. Drop "
+                    "'stream scale' to 0.5 in Settings - it shrinks the picture "
+                    "sent to the browser without affecting scoring accuracy.")
 
     if url:
         print(f"\n== stream from {url} ==")
         stream = probe_stream(url, token=token)
         if "error" in stream:
             print(f"  {stream['error']}")
+            verdicts.append("Could not measure the stream - is the server running? "
+                            "Start it with 'python -m dart_scorer serve' and pass "
+                            "the address it prints to --url.")
         else:
             print(f"  {stream['fps']} fps, {stream['kb_per_frame']} KB/frame")
             print(f"  gap mean {stream['gap_mean_ms']}ms, jitter {stream['jitter_ms']}ms, "
