@@ -15,7 +15,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import cv2                                          # noqa: E402
 import numpy as np                                  # noqa: E402
 
-from dart_scorer.camera import CONTROLS, CameraSource, fourcc_name  # noqa: E402
+from dart_scorer.camera import (                     # noqa: E402
+    CONTROLS, CameraSource, fourcc_name, parse_v4l2_controls, v4l2_ranges)
 
 
 def check(condition, message):
@@ -155,6 +156,69 @@ def test_describe_reports_what_the_camera_is_doing():
     check(info["width"] == 1280 and info["height"] == 720, "resolution reported")
     check(info["fourcc"] == "MJPG", f"pixel format reported, got {info['fourcc']}")
     check(info["backend"] == "fake", "backend reported")
+    source.release()
+
+
+# Real output from `v4l2-ctl --list-ctrls`, which is where the slider ranges in
+# the web UI come from - OpenCV can set a control but cannot say what it accepts.
+V4L2_SAMPLE = """User Controls
+
+                     brightness 0x00980900 (int)    : min=0 max=255 step=1 default=128 value=128
+                       contrast 0x00980901 (int)    : min=0 max=255 step=1 default=128 value=128
+                     saturation 0x00980902 (int)    : min=0 max=255 step=1 default=128 value=128
+        white_balance_automatic 0x0098090c (bool)   : default=1 value=1
+                           gain 0x00980913 (int)    : min=0 max=255 step=1 default=0 value=0
+      white_balance_temperature 0x0098091a (int)    : min=2000 max=6500 step=1 default=4000 value=4000 flags=inactive
+                      sharpness 0x0098091b (int)    : min=0 max=255 step=1 default=128 value=128
+         backlight_compensation 0x0098091c (int)    : min=0 max=1 step=1 default=0 value=0
+
+Camera Controls
+
+                  auto_exposure 0x009a0901 (menu)   : min=0 max=3 default=3 value=3
+         exposure_time_absolute 0x009a0902 (int)    : min=3 max=2047 step=1 default=250 value=250 flags=inactive
+     focus_automatic_continuous 0x009a090c (bool)   : default=1 value=1
+                 focus_absolute 0x009a090a (int)    : min=0 max=250 step=5 default=0 value=0 flags=inactive
+                  zoom_absolute 0x009a090d (int)    : min=100 max=400 step=1 default=100 value=100
+"""
+
+
+def test_v4l2_ranges_parse_into_slider_bounds():
+    ranges = parse_v4l2_controls(V4L2_SAMPLE)
+    check(ranges["focus"]["min"] == 0 and ranges["focus"]["max"] == 250,
+          f"focus range should be 0-250, got {ranges.get('focus')}")
+    check(ranges["focus"]["step"] == 5, "focus step should be 5")
+    check(ranges["zoom"]["min"] == 100 and ranges["zoom"]["max"] == 400,
+          f"zoom range should be 100-400, got {ranges.get('zoom')}")
+    check(ranges["exposure"]["max"] == 2047,
+          "exposure_time_absolute should map to our 'exposure'")
+    check(ranges["wb_temperature"]["min"] == 2000, "white balance range found")
+    check(ranges["brightness"]["default"] == 128, "defaults are captured")
+
+
+def test_v4l2_booleans_have_no_range():
+    """A bool has no min/max, so the UI must fall back to a checkbox."""
+    ranges = parse_v4l2_controls(V4L2_SAMPLE)
+    check("autofocus" not in ranges, "focus_automatic_continuous is a bool, no range")
+    check("auto_wb" not in ranges, "white_balance_automatic is a bool, no range")
+
+
+def test_v4l2_parsing_survives_rubbish():
+    check(parse_v4l2_controls("") == {}, "empty input gives nothing")
+    check(parse_v4l2_controls("not a control listing\n\n???") == {},
+          "unparseable input gives nothing rather than raising")
+
+
+def test_v4l2_ranges_absent_off_linux():
+    """The lookup is best-effort; without v4l2-ctl it must return {} quietly."""
+    check(isinstance(v4l2_ranges(0), dict), "always returns a dict")
+
+
+def test_controls_report_ranges_when_known():
+    source = CameraSource(FakeCapture(), "test", drain=False)
+    source._ranges = parse_v4l2_controls(V4L2_SAMPLE)
+    readback = source.read_controls({})
+    check(readback["focus"]["range"]["max"] == 250, "focus range reaches the UI")
+    check(readback["pan"]["range"] is None, "a control with no range says so")
     source.release()
 
 

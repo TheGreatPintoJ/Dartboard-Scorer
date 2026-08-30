@@ -78,6 +78,13 @@ class DartDetector:
         motion_threshold: int = 120,   # changed pixels per frame that count as movement
         learn_frames: int = 25,
         min_elongation: float = 2.0,
+        # Which end of the blob is the point:
+        #   centre    - the end nearer the bull. Right for almost every setup,
+        #               because the barrel and flight extend away from the board.
+        #   lowest    - the end lowest in frame; for a camera above the board.
+        #   highest   - the end highest in frame; for a camera below it.
+        #   leftmost  - the end furthest left; for a camera off to the right.
+        #   rightmost - the end furthest right; for a camera off to the left.
         tip_mode: str = "centre",
     ) -> None:
         self.calib = calibration
@@ -259,6 +266,10 @@ class DartDetector:
             pick = int(np.argmax([e[1] for e in ends]))
         elif self.tip_mode == "highest":
             pick = int(np.argmin([e[1] for e in ends]))
+        elif self.tip_mode == "leftmost":
+            pick = int(np.argmin([e[0] for e in ends]))
+        elif self.tip_mode == "rightmost":
+            pick = int(np.argmax([e[0] for e in ends]))
         else:
             # "centre": the barrel and flight always point away from the bull,
             # so the end nearer the centre of the board is the point.

@@ -140,10 +140,20 @@ boundary. Low-confidence calls are marked in amber - those are the ones to check
 
 ## Camera settings
 
-Open **Camera controls** under the video. Every row shows what the camera
-*actually* reports after a change, because cameras routinely accept a value and
-then ignore or clamp it - if the reading does not move, that camera does not
-support that control. Blank a box to stop setting it at all.
+**Camera controls** sits under the video: focus, zoom, exposure, auto-exposure,
+autofocus, gain, brightness, contrast, saturation, sharpness, auto white
+balance, colour temperature, pan, tilt and backlight compensation. They apply
+live, without reopening the camera.
+
+Every row shows what the camera *actually* reports after a change, because
+cameras routinely accept a value and then ignore or clamp it - if the reading
+does not move, that camera does not support that control. Blank a box to stop
+setting it at all.
+
+OpenCV can set a control but cannot say what range it accepts. On Linux the
+ranges are read from `v4l2-ctl --list-ctrls` (install `v4l2-utils`), so the
+controls appear as **sliders with the camera's real limits**; elsewhere they are
+number boxes and you tune by watching the reading.
 
 - **Lock focus & white balance** freezes the lens where it is. Do this before
   scoring: autofocus hunts, which pulses the picture and, worse, shifts the
@@ -243,7 +253,22 @@ Settings in the web UI; the CLI has matching flags.
 | max blob px | 26000 | largest; beyond 3x this the board is treated as occluded |
 | settle frames | 4 | still frames required before scoring |
 | motion px | 120 | changed pixels per frame that count as movement |
-| tip end | nearer the bull | which end of the blob is the point |
+| tip end | nearer the bull | which end of the blob is the point - see below |
+
+**Tip end** decides which end of the dart is the point. The blob is the whole
+dart, so one end is the point in the board and the other is the flight; which is
+which depends on where the camera sits.
+
+| mode | use when |
+|---|---|
+| nearer the bull | almost always - the barrel and flight extend away from the board |
+| lowest | the camera is above the board |
+| highest | the camera is below the board |
+| leftmost | the camera is off to the right |
+| rightmost | the camera is off to the left |
+
+Start with "nearer the bull". The others are for a camera mounted so close to the
+board's plane that a dart can point back towards the centre in the image.
 
 If it misses darts, lower the threshold and the minimum blob size; if it invents
 them, raise both. Bolt the camera down - any shift needs re-calibration - light
@@ -257,7 +282,8 @@ python -m dart_scorer selftest    # synthetic throws through the whole pipeline
 python tests/test_geometry.py     # scoring geometry
 python tests/test_session.py      # visits, busts, checkouts, undo
 python -m dart_scorer doctor      # camera, machine and stream diagnostics
-python tests/test_camera.py       # capture layer: drain thread, controls
+python tests/test_camera.py       # capture layer: drain thread, controls, v4l2
+python tests/test_detector.py     # tip-end selection on known throws
 python tests/test_webapp.py       # the live service, end to end, no camera
 ```
 
@@ -299,7 +325,8 @@ deploy/
   install.sh               one-shot installer
   nginx-dart-scorer.conf   optional reverse proxy
 tests/
-  test_geometry.py  test_session.py  test_camera.py  test_webapp.py
+  test_geometry.py  test_session.py  test_camera.py
+  test_detector.py  test_webapp.py
 ```
 
 `board.png` is a reference render of the canonical board; `example_overlay.png`

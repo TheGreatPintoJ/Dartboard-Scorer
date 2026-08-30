@@ -17,6 +17,8 @@ Three things here matter far more than they look:
 
 from __future__ import annotations
 
+import re
+import subprocess
 import sys
 import threading
 import time
@@ -106,7 +108,76 @@ def open_capture(cfg):
 
     # A file is not live: read it at the pace the caller asks for.
     live = is_index or "://" in source
-    return CameraSource(cap, source, drain=live)
+    return CameraSource(cap, source, drain=live,
+                        index=int(source) if is_index else None)
+
+
+# OpenCV can set a control but cannot say what range it accepts, so the web UI
+# would be reduced to "type a number and see what happens". On Linux v4l2-ctl
+# knows the real min/max/step, which turns those boxes into sliders. The names
+# differ between kernel versions, hence the alternatives.
+V4L2_NAMES: dict[str, tuple[str, ...]] = {
+    "autofocus": ("focus_automatic_continuous", "focus_auto"),
+    "focus": ("focus_absolute",),
+    "zoom": ("zoom_absolute",),
+    "auto_exposure": ("auto_exposure", "exposure_auto"),
+    "exposure": ("exposure_time_absolute", "exposure_absolute"),
+    "gain": ("gain",),
+    "brightness": ("brightness",),
+    "contrast": ("contrast",),
+    "saturation": ("saturation",),
+    "sharpness": ("sharpness",),
+    "auto_wb": ("white_balance_automatic", "white_balance_temperature_auto"),
+    "wb_temperature": ("white_balance_temperature",),
+    "pan": ("pan_absolute",),
+    "tilt": ("tilt_absolute",),
+    "backlight": ("backlight_compensation",),
+}
+
+_CONTROL_LINE = re.compile(
+    r"^\s*(?P<name>\w+)\s+0x[0-9a-fA-F]+\s+\((?P<kind>\w+)\)\s*:\s*(?P<rest>.*)$")
+
+
+def v4l2_ranges(index: int, timeout: float = 2.0) -> dict:
+    """min/max/step/default per control, from v4l2-ctl. {} when unavailable."""
+    if not sys.platform.startswith("linux"):
+        return {}
+    try:
+        out = subprocess.run(
+            ["v4l2-ctl", "-d", f"/dev/video{index}", "--list-ctrls"],
+            capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return {}                                  # v4l2-utils not installed
+    if out.returncode != 0:
+        return {}
+    return parse_v4l2_controls(out.stdout)
+
+
+def parse_v4l2_controls(text: str) -> dict:
+    """Pull min/max/step/default out of `v4l2-ctl --list-ctrls` output."""
+    found = {}
+    for line in text.splitlines():
+        match = _CONTROL_LINE.match(line)
+        if not match:
+            continue
+        fields = dict(part.split("=", 1) for part in match.group("rest").split()
+                      if "=" in part)
+        entry = {"kind": match.group("kind")}
+        for key in ("min", "max", "step", "default"):
+            if key in fields:
+                try:
+                    entry[key] = float(fields[key])
+                except ValueError:
+                    pass
+        found[match.group("name")] = entry
+
+    ranges = {}
+    for ours, candidates in V4L2_NAMES.items():
+        for name in candidates:
+            if name in found and "min" in found[name] and "max" in found[name]:
+                ranges[ours] = found[name]
+                break
+    return ranges
 
 
 def fourcc_name(value: float) -> str:
@@ -130,9 +201,12 @@ class CameraSource:
     as fast as it decodes is not what anyone wants.
     """
 
-    def __init__(self, cap, name: str, drain: bool = False) -> None:
+    def __init__(self, cap, name: str, drain: bool = False,
+                 index: int | None = None) -> None:
         self._cap = cap
         self.name = name
+        self._index = index
+        self._ranges: dict | None = None        # looked up once, then cached
         self._cap_lock = threading.Lock()      # VideoCapture is not thread-safe
         self._latest = None
         self._latest_lock = threading.Lock()
@@ -201,6 +275,8 @@ class CameraSource:
     def read_controls(self, requested: dict | None = None) -> dict:
         """Current value of every control, with what was asked for alongside."""
         requested = requested or {}
+        if self._ranges is None:
+            self._ranges = v4l2_ranges(self._index) if self._index is not None else {}
         out = {}
         for name, prop in CONTROLS.items():
             try:
@@ -213,6 +289,7 @@ class CameraSource:
                 "requested": requested.get(name),
                 # A property the backend does not implement reads back as -1.
                 "supported": actual is not None and float(actual) != -1.0,
+                "range": self._ranges.get(name),
             }
         return out
 

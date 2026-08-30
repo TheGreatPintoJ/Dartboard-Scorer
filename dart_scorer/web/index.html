@@ -85,13 +85,14 @@
                     text-transform: uppercase; letter-spacing: .08em; font-weight: 600; }
   details[open] summary { margin-bottom: 12px; }
   .controls { margin-top: 12px; }
-  .ctl { display: grid; grid-template-columns: 1fr 120px 62px auto; gap: 10px;
+  .ctl { display: grid; grid-template-columns: 1fr 150px 62px auto; gap: 10px;
          align-items: center; padding: 5px 0; border-bottom: 1px solid var(--line); }
   .ctl-name { font-size: 13px; }
   .ctl-read { font-size: 12px; color: var(--muted); text-align: right;
               font-variant-numeric: tabular-nums; }
   .ctl.unsupported { opacity: .45; }
   .ctl input[type=checkbox] { justify-self: start; width: auto; }
+  .ctl input[type=range] { width: 100%; padding: 0; background: none; border: none; }
   .toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
            background: #2f3540; border: 1px solid var(--line); padding: 9px 16px;
            border-radius: 9px; opacity: 0; transition: opacity .25s; z-index: 9; }
@@ -133,7 +134,7 @@
     </div>
 
     <div class="card" id="camera-card">
-      <details id="camera-details">
+      <details id="camera-details" open>
         <summary>Camera controls</summary>
         <div class="row" style="margin-top:12px">
           <span class="pill" id="cam-actual">not open</span>
@@ -143,10 +144,12 @@
         <p class="hint" id="cam-warn" hidden></p>
         <div id="controls" class="controls"></div>
         <p class="hint">
-          Ranges are camera-specific and unlabelled by the driver, so each row
-          shows what the camera <b>actually</b> reports after the change - if it
-          does not move, that camera does not support it. Blank a box to stop
-          setting that control at all.
+          Each row shows what the camera <b>actually</b> reports after a change -
+          cameras routinely accept a value and then ignore or clamp it, so if the
+          reading does not move, that camera does not support that control.
+          Controls appear as sliders where the driver publishes a real range
+          (Linux, via <code>v4l2-ctl</code>) and as boxes otherwise; blank a box
+          to stop setting that control at all.
           <b>Autofocus and auto-exposure should be off</b> while scoring: both
           hunt, which pulses the picture and shifts the reference frame the
           detector compares against.
@@ -238,9 +241,11 @@
           <label class="field">Motion px <input id="cfg-motion" type="number"></label>
           <label class="field">Tip end
             <select id="cfg-tip">
-              <option value="centre">nearer the bull</option>
-              <option value="lowest">lowest</option>
-              <option value="highest">highest</option>
+              <option value="centre">nearer the bull (default)</option>
+              <option value="lowest">lowest - camera above the board</option>
+              <option value="highest">highest - camera below the board</option>
+              <option value="leftmost">leftmost - camera to the right</option>
+              <option value="rightmost">rightmost - camera to the left</option>
             </select></label>
         </div>
 
@@ -491,22 +496,41 @@ function renderCamera(info) {
     const row = document.createElement("div");
     row.className = "ctl" + (c.supported ? "" : " unsupported");
     const value = c.requested ?? "";
-    const input = kind === "toggle"
-      ? `<input type="checkbox" data-ctl="${name}" ${Number(c.actual) > 0 ? "checked" : ""}>`
-      : `<input type="number" step="any" data-ctl="${name}" value="${value}"
-                placeholder="${c.actual ?? ""}">`;
-    row.innerHTML = `<span class="ctl-name">${label}</span>${input}` +
+    const r = c.range;
+    let input;
+    if (kind === "toggle") {
+      input = `<input type="checkbox" data-ctl="${name}" ${Number(c.actual) > 0 ? "checked" : ""}>`;
+    } else if (r && r.max > r.min) {
+      // The driver told us the real range, so a slider beats guessing numbers.
+      input = `<input type="range" data-ctl="${name}" min="${r.min}" max="${r.max}"
+                      step="${r.step || 1}" value="${value === "" ? (c.actual ?? r.default ?? r.min) : value}">`;
+    } else {
+      input = `<input type="number" step="any" data-ctl="${name}" value="${value}"
+                      placeholder="${c.actual ?? ""}">`;
+    }
+    const hint = r && r.max > r.min ? ` title="range ${r.min} to ${r.max}"` : "";
+    row.innerHTML = `<span class="ctl-name"${hint}>${label}</span>${input}` +
       `<span class="ctl-read" title="what the camera reports now">${c.actual ?? "-"}</span>` +
       (c.supported ? "" : `<span class="pill">unsupported</span>`);
     box.appendChild(row);
   }
   box.querySelectorAll("[data-ctl]").forEach((el) => {
-    el.onchange = () => {
+    const send = () => {
       const name = el.dataset.ctl;
       const value = el.type === "checkbox" ? (el.checked ? 1 : 0)
         : el.value === "" ? null : Number(el.value);
       setControls({ [name]: value });
     };
+    el.onchange = send;
+    if (el.type === "range") {
+      // Show the value while dragging, but only ask the camera once the drag
+      // settles - a request per pixel of travel would swamp it.
+      el.oninput = () => {
+        el.parentElement.querySelector(".ctl-read").textContent = el.value;
+        clearTimeout(el._timer);
+        el._timer = setTimeout(send, 250);
+      };
+    }
   });
 }
 
@@ -544,6 +568,7 @@ $("btn-lock-focus").onclick = () => {
 $("camera-details").addEventListener("toggle", () => {
   if ($("camera-details").open && !cameraInfo) loadCamera();
 });
+loadCamera();
 
 /* ------------------------------------------------------------- commands */
 async function command(name, extra = {}) {
