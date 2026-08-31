@@ -32,6 +32,15 @@ REFERENCE_POINTS: tuple[tuple[str, float, float], ...] = (
 )
 
 
+# The same mm -> canonical mapping as board_to_canon, as a matrix, so it can be
+# composed with a homography. See Calibration.board_matrix.
+A_BOARD_TO_CANON = np.array([
+    [PX_PER_MM, 0.0, CANON_CENTRE[0]],
+    [0.0, PX_PER_MM, CANON_CENTRE[1]],
+    [0.0, 0.0, 1.0],
+], dtype=np.float64)
+
+
 def board_to_canon(x_mm: float, y_mm: float) -> tuple[float, float]:
     return CANON_CENTRE[0] + x_mm * PX_PER_MM, CANON_CENTRE[1] + y_mm * PX_PER_MM
 
@@ -105,6 +114,65 @@ class Calibration:
         x, y = self.to_board_mm(image_point)
         return geo.score_at(x, y)
 
+    # -- lines on the board plane -----------------------------------------
+    def board_matrix(self) -> np.ndarray:
+        """``G``: homogeneous board millimetres -> image pixels.
+
+        This is :meth:`board_mm_to_image` written as a matrix, which is what
+        lets a whole *line* be pushed onto the board rather than a point.
+        """
+        g = getattr(self, "_G", None)
+        if g is None:
+            g = self.H_inv @ A_BOARD_TO_CANON
+            object.__setattr__(self, "_G", g)
+        return g
+
+    def image_line_to_board(self, line) -> np.ndarray:
+        """Push an image line ``(a, b, c)`` onto the board plane.
+
+        A board point ``X`` lies on the result exactly when its image ``G @ X``
+        lies on ``line``, so the answer is ``G.T @ line``: the shadow the line
+        casts on the board from this camera's viewpoint.
+
+        Returned normalised (``a^2 + b^2 == 1``) so that ``L @ (x, y, 1)`` is a
+        signed distance in millimetres.
+        """
+        board = self.board_matrix().T @ np.asarray(line, dtype=np.float64)
+        return normalise_line(board)
+
+    # -- frame size --------------------------------------------------------
+    def for_frame_size(self, size) -> "Calibration":
+        """This calibration, valid for a frame of ``size`` (width, height).
+
+        The homography is in raw pixel coordinates, so feeding it frames at a
+        resolution other than the one it was marked at silently scores every
+        dart in the wrong place - a 1920x1080 calibration fed 1280x720 puts the
+        bull a quarter of a metre out. A uniform rescale is recoverable and is
+        applied here; anything else is not, and raises.
+        """
+        want = (int(size[0]), int(size[1]))
+        if not self.frame_size:
+            # Saved before the size was recorded. The homography is unchanged;
+            # we simply now know what it was marked at, so note it and carry on
+            # rather than pretending this is a different calibration.
+            self.frame_size = want
+            return self
+        have = (int(self.frame_size[0]), int(self.frame_size[1]))
+        if have == want:
+            return self
+        sx, sy = want[0] / have[0], want[1] / have[1]
+        if abs(sx - sy) > 0.01:
+            raise ValueError(
+                f"calibration was marked at {have[0]}x{have[1]} but the camera "
+                f"is delivering {want[0]}x{want[1]}; the aspect ratio differs, "
+                "so it cannot be rescaled - recalibrate at this resolution")
+        scale = np.array([[1 / sx, 0.0, 0.0], [0.0, 1 / sy, 0.0], [0.0, 0.0, 1.0]])
+        return Calibration(
+            H=self.H @ scale,
+            image_points=[[p[0] * sx, p[1] * sy] for p in self.image_points],
+            frame_size=want,
+        )
+
     def warp(self, frame) -> np.ndarray:
         """Rectify a camera frame into the canonical top-down board view."""
         return cv2.warpPerspective(frame, self.H, (CANON_SIZE, CANON_SIZE))
@@ -128,6 +196,36 @@ class Calibration:
             image_points=data.get("image_points", []),
             frame_size=tuple(size) if size else None,
         )
+
+
+def normalise_line(line) -> np.ndarray:
+    """Scale ``(a, b, c)`` so ``a^2 + b^2 == 1``.
+
+    Then evaluating the line at a point gives a signed distance in whatever
+    units the point is in, which is what makes every threshold downstream
+    physically meaningful rather than an arbitrary scale.
+    """
+    line = np.asarray(line, dtype=np.float64)
+    n = float(np.hypot(line[0], line[1]))
+    if n < 1e-12:
+        raise ValueError("degenerate line: it has no direction")
+    return line / n
+
+
+def line_through(p, q) -> np.ndarray:
+    """Normalised homogeneous line through two 2D points."""
+    return normalise_line(np.cross([p[0], p[1], 1.0], [q[0], q[1], 1.0]))
+
+
+def line_from_point_direction(point, direction) -> np.ndarray:
+    """Normalised homogeneous line through ``point`` along ``direction``."""
+    dx, dy = float(direction[0]), float(direction[1])
+    n = float(np.hypot(dx, dy))
+    if n < 1e-12:
+        raise ValueError("degenerate direction")
+    dx, dy = dx / n, dy / n
+    px, py = float(point[0]), float(point[1])
+    return np.array([dy, -dx, dx * py - dy * px], dtype=np.float64)
 
 
 def fit_board_ellipse(frame) -> tuple | None:

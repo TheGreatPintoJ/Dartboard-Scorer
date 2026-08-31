@@ -16,7 +16,8 @@ import numpy as np
 
 from . import geometry as geo
 from . import render
-from .calibration import CANON_SIZE, Calibration, board_to_canon, reference_canon_points
+from .calibration import (A_BOARD_TO_CANON, CANON_SIZE, REFERENCE_POINTS,
+                          Calibration, board_to_canon, reference_canon_points)
 
 
 class SyntheticView:
@@ -68,6 +69,139 @@ def synthetic_camera(width=960, height=720, skew=0.16, seed=7):
         reference_canon_points().reshape(-1, 1, 2), H_cam).reshape(-1, 2)
     calib = Calibration.from_points(image_points, (width, height))
     return board, view, calib
+
+
+# ---------------------------------------------------------------------- #
+# 3D: a dart that actually stands proud of the board
+# ---------------------------------------------------------------------- #
+# The 2D synthetic camera above draws darts *lying in* the board plane, which
+# is fine for exercising detection and scoring but has zero parallax - so it
+# cannot exercise the two-view geometry at all. These build a real pinhole
+# camera instead, with a centre to project off-plane points from.
+#
+# World frame is the board frame of geometry.py: millimetres, origin at the
+# bull, +x right, +y down, and +z out of the face towards the thrower.
+
+class Camera3D:
+    """A pinhole camera looking at the board."""
+
+    def __init__(self, K, R, C):
+        self.K = np.asarray(K, dtype=np.float64)
+        self.R = np.asarray(R, dtype=np.float64)       # world -> camera
+        self.C = np.asarray(C, dtype=np.float64)       # centre, world mm
+
+    def project(self, points):
+        """3D board-frame millimetres -> image pixels."""
+        pts = np.atleast_2d(np.asarray(points, dtype=np.float64))
+        cam = (self.R @ (pts - self.C).T).T
+        img = (self.K @ cam.T).T
+        return img[:, :2] / img[:, 2:3]
+
+    def board_matrix(self) -> np.ndarray:
+        """Board millimetres (z = 0) -> image pixels, as a homography."""
+        return self.K @ np.column_stack([self.R[:, 0], self.R[:, 1], -self.R @ self.C])
+
+
+def look_at(distance_mm, azimuth_deg, elevation_deg, fov_deg, width, height):
+    """A camera at the given bearing from the board, aimed at the bull."""
+    az, el = np.radians(azimuth_deg), np.radians(elevation_deg)
+    # Same angle convention as geo.polar_to_board: 0 = east, 90 = north, y down.
+    c = distance_mm * np.array([np.cos(el) * np.cos(az),
+                                -np.cos(el) * np.sin(az),
+                                np.sin(el)])
+    f = -c / np.linalg.norm(c)                       # towards the bull
+    up_hint = np.array([0.0, -1.0, 0.0])             # -y is up on the board
+    r = np.cross(f, up_hint)
+    if np.linalg.norm(r) < 1e-9:                     # looking straight down +y
+        r = np.cross(f, np.array([0.0, 0.0, 1.0]))
+    r /= np.linalg.norm(r)
+    u = np.cross(r, f)
+    fx = (width / 2.0) / np.tan(np.radians(fov_deg) / 2.0)
+    K = np.array([[fx, 0.0, width / 2.0],
+                  [0.0, fx, height / 2.0],
+                  [0.0, 0.0, 1.0]])
+    return Camera3D(K, np.vstack([r, u, f]), c)
+
+
+def synthetic_camera_3d(width=1280, height=720, *, distance_mm=1200.0,
+                        azimuth_deg=35.0, elevation_deg=25.0, fov_deg=55.0,
+                        seed=7, click_px=0.0):
+    """Return (board image, view, calibration, camera) for a real 3D camera.
+
+    ``click_px`` adds gaussian noise to the four landmarks the calibration is
+    solved from, so tests can ask what an imperfectly clicked calibration does.
+    """
+    rng = np.random.default_rng(seed)
+    cam = look_at(distance_mm, azimuth_deg, elevation_deg, fov_deg, width, height)
+
+    # canonical board pixels -> image, for warping the rendered board in.
+    H_cam = cam.board_matrix() @ np.linalg.inv(A_BOARD_TO_CANON)
+    board = render.render_board()
+    view = SyntheticView(H_cam, width, height, rng)
+
+    marks = np.array([geo.polar_to_board(r, a) for _, r, a in REFERENCE_POINTS])
+    image_points = cam.project(np.column_stack([marks, np.zeros(len(marks))]))
+    if click_px:
+        image_points = image_points + rng.normal(0, click_px, image_points.shape)
+    calib = Calibration.from_points(image_points, (width, height))
+    return board, view, calib, cam
+
+
+def synthetic_pair(width=1280, height=720, *, separation_deg=90.0,
+                   azimuth_deg=35.0, **kw):
+    """Two cameras around the board, both aimed at the bull.
+
+    Returns ``(board, [view_a, view_b], [calib_a, calib_b], [cam_a, cam_b])``.
+    """
+    a = synthetic_camera_3d(width, height, azimuth_deg=azimuth_deg, **kw)
+    b = synthetic_camera_3d(width, height,
+                            azimuth_deg=azimuth_deg + separation_deg, **kw)
+    return a[0], [a[1], b[1]], [a[2], b[2]], [a[3], b[3]]
+
+
+def dart_axis_3d(x_mm, y_mm, azimuth_deg, elevation_deg):
+    """Unit vector along a dart's shaft, pointing away from the board."""
+    az, el = np.radians(azimuth_deg), np.radians(elevation_deg)
+    return np.array([np.cos(el) * np.cos(az),
+                     -np.cos(el) * np.sin(az),
+                     np.sin(el)])
+
+
+def draw_dart_3d(image, cam, x_mm, y_mm, *, azimuth_deg=None, elevation_deg=20.0,
+                 length_mm=150.0, buried_mm=8.0, flight=True):
+    """Draw a dart standing out of the board, as ``cam`` would see it.
+
+    ``buried_mm`` is how much of the point is hidden in the board, i.e. how far
+    up the shaft the *visible* end starts. That gap is the whole reason a single
+    camera reads the dart in the wrong place, so it is not a detail: it is the
+    thing under test.
+    """
+    if azimuth_deg is None:                 # point away from the bull by default
+        azimuth_deg = geo.angle_of(x_mm, y_mm) if (x_mm or y_mm) else 0.0
+    d = dart_axis_3d(x_mm, y_mm, azimuth_deg, elevation_deg)
+    tip = np.array([x_mm, y_mm, 0.0])
+    visible = tip + buried_mm * d
+    tail = tip + length_mm * d
+
+    p_vis, p_tail = cam.project([visible, tail])
+    shaft = (tuple(np.round(p_vis).astype(int)), tuple(np.round(p_tail).astype(int)))
+    cv2.line(image, shaft[0], shaft[1], (60, 60, 60), 7, cv2.LINE_AA)     # barrel
+    cv2.line(image, shaft[0], shaft[1], (210, 210, 210), 3, cv2.LINE_AA)  # highlight
+
+    if flight:
+        # A real flight is wide (about 35 mm) and sits at the far end. It is the
+        # reason a contour-fitted principal axis misses the shaft, so model it
+        # with actual width rather than as a dot.
+        perp = np.cross(d, [0.0, 0.0, 1.0])
+        if np.linalg.norm(perp) < 1e-6:
+            perp = np.array([1.0, 0.0, 0.0])
+        perp /= np.linalg.norm(perp)
+        base = tip + (length_mm - 42.0) * d
+        corners = cam.project([base, base + 17.0 * perp + 20.0 * d,
+                               tail, base - 17.0 * perp + 20.0 * d])
+        cv2.fillConvexPoly(image, np.round(corners).astype(np.int32), (40, 200, 240),
+                           cv2.LINE_AA)
+    return image
 
 
 def draw_dart_on_board(canvas, x_mm, y_mm, length_mm=95.0, jitter_deg=0.0):

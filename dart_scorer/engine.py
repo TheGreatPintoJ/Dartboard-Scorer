@@ -94,6 +94,8 @@ class ScoringEngine:
         self._log_writer = None
         self._log_file = None
 
+        self._frame_size: tuple[int, int] | None = None
+        self._open_error: str | None = None
         self._load_calibration()
 
     # ------------------------------------------------------------------ #
@@ -132,6 +134,40 @@ class ScoringEngine:
         except Exception as exc:                       # corrupt or hand-edited
             self._error = f"could not load {path}: {exc}"
             self._state = "no calibration"
+
+    def _fit_calibration_to_frame(self, size) -> None:
+        """Check the calibration actually belongs to the frames arriving.
+
+        The homography is in raw pixel coordinates, so a calibration marked at
+        one resolution silently scores every dart in the wrong place at another
+        - a 1920x1080 calibration fed 1280x720 frames puts the bull about
+        250 mm out, which rejects every throw as off-board with no clue why.
+        Nothing used to compare the two. A uniform rescale is recoverable and
+        is applied; anything else refuses to score and says so.
+        """
+        with self._lock:
+            calib = self.calibration
+            if calib is None:
+                return
+            try:
+                fitted = calib.for_frame_size(size)
+            except ValueError as exc:
+                self.calibration = None
+                self.detector = None
+                self._state = "no calibration"
+                self._error = str(exc)
+                self.events.publish("state", state=self._state, error=self._error)
+                return
+            if fitted is calib:
+                return
+            self.calibration = fitted
+            self._rebuild_detector()
+            note = (f"calibration rescaled from {tuple(calib.frame_size)} to "
+                    f"{tuple(size)}; recalibrate at this resolution for best "
+                    "accuracy")
+            self._error = note
+        self.events.publish("calibration", points=fitted.image_points,
+                            saved=False, note=note)
 
     def _rebuild_detector(self) -> None:
         if self.calibration is None:
@@ -464,6 +500,27 @@ class ScoringEngine:
             self._frame_cond.notify_all()
 
     def _loop(self) -> None:
+        # Any exception escaping here used to end scoring for the life of the
+        # process while _running stayed true, so the browser sat on a frozen
+        # status and /healthz still reported ok. Whatever breaks, say so and
+        # keep going.
+        while self._running:
+            try:
+                self._scoring_loop()
+            except Exception as exc:                       # pragma: no cover
+                with self._lock:
+                    self._state = "error"
+                    self._error = f"{type(exc).__name__}: {exc}"
+                    if self._source is not None:
+                        try:
+                            self._source.release()
+                        except Exception:
+                            pass
+                        self._source = None
+                self.events.publish("state", state="error", error=self._error)
+                time.sleep(1.0)
+
+    def _scoring_loop(self) -> None:
         last = time.time()
         while self._running:
             with self._lock:
@@ -472,11 +529,23 @@ class ScoringEngine:
                 with self._lock:
                     if self._source:
                         self._source.release()
-                    self._source = open_source(self.config.camera)
+                    try:
+                        self._source = open_source(self.config.camera)
+                    except Exception as exc:
+                        # A backend that raises rather than returning None used
+                        # to kill this thread outright: _running stayed true, so
+                        # the browser saw a frozen status and /healthz still
+                        # said ok, forever. Treat it as "no camera" and retry.
+                        self._source = None
+                        self._open_error = f"{type(exc).__name__}: {exc}"
                     self._reopen = False
                     if self._source is None:
                         self._state = "no camera"
-                        self._error = f"cannot open camera {self.config.camera.source!r}"
+                        detail = getattr(self, "_open_error", None)
+                        self._error = (
+                            f"cannot open camera {self.config.camera.source!r}"
+                            + (f": {detail}" if detail else ""))
+                        self._open_error = None
                     else:
                         self._error = None
                         self._state = "learning" if self.calibration else "no calibration"
@@ -502,6 +571,11 @@ class ScoringEngine:
             now = time.time()
             self._fps = 0.9 * self._fps + 0.1 / max(now - last, 1e-6)
             last = now
+
+            size = (frame.shape[1], frame.shape[0])
+            if size != self._frame_size:
+                self._frame_size = size
+                self._fit_calibration_to_frame(size)
 
             with self._lock:
                 self._raw = frame

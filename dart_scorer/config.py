@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
 
 DEFAULT_CONFIG_PATH = "config.json"
@@ -55,10 +55,37 @@ class GameConfig:
 
 
 @dataclass
+class FusionConfig:
+    """Combining two views of the same dart.
+
+    A single camera measures the end of the dart's *visible* blob, which stands
+    proud of the board, so perspective carries it sideways. A second view fixes
+    that - but only when the geometry is sound, hence the gates.
+    """
+
+    enabled: bool = True
+    # Two views' shadows crossing at a shallower angle than this are too
+    # ill-conditioned to trust; below it we keep the primary's own answer.
+    min_sin_theta: float = 0.42            # sin(25 degrees)
+    # If fusing moves the point further than this, something is wrong with the
+    # match. Keeping the single-view answer bounds the worst case to "no worse
+    # than one camera".
+    max_correction_mm: float = 30.0
+    # Two views whose own estimates are further apart than this are looking at
+    # different darts.
+    max_pair_mm: float = 60.0
+    min_segment_mm: float = 40.0
+    endpoint_tolerance_mm: float = 60.0
+    # How far apart two views' settle times may be and still be the same dart.
+    match_window: float = 0.8
+
+
+@dataclass
 class AppConfig:
     camera: CameraConfig = field(default_factory=CameraConfig)
     detector: DetectorConfig = field(default_factory=DetectorConfig)
     game: GameConfig = field(default_factory=GameConfig)
+    fusion: FusionConfig = field(default_factory=FusionConfig)
     calibration_path: str = "calibration.json"
     log_path: str = "throws.csv"
 
@@ -82,7 +109,11 @@ class AppConfig:
         on precisely what moved.
         """
         changed = []
-        sections = {"camera": self.camera, "detector": self.detector, "game": self.game}
+        # Derived from our own fields rather than listed by hand: a hardcoded
+        # list silently discards any section added later, which is a miserable
+        # thing to debug from the browser side.
+        sections = {f.name: getattr(self, f.name) for f in fields(self)
+                    if is_dataclass(getattr(self, f.name))}
         for key, value in (patch or {}).items():
             if key in sections and isinstance(value, dict):
                 section = sections[key]

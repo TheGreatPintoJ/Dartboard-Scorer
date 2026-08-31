@@ -25,6 +25,7 @@ from enum import Enum
 import cv2
 import numpy as np
 
+from . import fusion
 from . import geometry as geo
 from .calibration import Calibration
 
@@ -44,6 +45,13 @@ class Dart:
     area: float
     elongation: float
     confidence: float
+    # The dart's axis in this image, and both ends of it. A single view cannot
+    # tell where along this line the point actually is - that is the parallax
+    # limit - so it is kept for a second view to intersect against.
+    axis_image: tuple[float, float, float] | None = None
+    ends_image: tuple[tuple[float, float], tuple[float, float]] | None = None
+    axis_sigma_deg: float = 0.0
+    fusion: dict | None = None
 
     @property
     def label(self) -> str:
@@ -86,6 +94,9 @@ class DartDetector:
         #   leftmost  - the end furthest left; for a camera off to the right.
         #   rightmost - the end furthest right; for a camera off to the left.
         tip_mode: str = "centre",
+        # Slack on the "outside the board" reject, for when a second view is
+        # about to correct the point. 0 keeps the single-camera behaviour.
+        reject_margin_mm: float = 0.0,
     ) -> None:
         self.calib = calibration
         self.diff_threshold = diff_threshold
@@ -96,6 +107,7 @@ class DartDetector:
         self.learn_frames = learn_frames
         self.min_elongation = min_elongation
         self.tip_mode = tip_mode
+        self.reject_margin_mm = reject_margin_mm
 
         self.state = State.LEARNING
         self._base: np.ndarray | None = None
@@ -241,23 +253,17 @@ class DartDetector:
         if not contours:
             return None
         contour = max(contours, key=cv2.contourArea)
-        pts = contour.reshape(-1, 2).astype(np.float64)
         area = float(cv2.contourArea(contour))
 
-        mean = pts.mean(axis=0)
-        centred = pts - mean
-        _, sv, vt = np.linalg.svd(centred, full_matrices=False)
-        axis = vt[0]
-        elongation = float(sv[0] / max(sv[1], 1e-6))
-
-        proj = centred @ axis
-        ends = []
-        for extreme in (proj.min(), proj.max()):
-            # Average the few pixels at each end so one stray pixel cannot move
-            # the answer by half a segment.
-            near = pts[np.abs(proj - extreme) <= 2.0]
-            ends.append(near.mean(axis=0) if len(near)
-                        else pts[int(np.argmin(np.abs(proj - extreme)))])
+        # Fitted to the mask's pixels weighted by inverse thickness, not to the
+        # contour: a dart's silhouette is not symmetric about its shaft (the
+        # flight is ~35 mm across, the barrel ~6 mm), so a contour fit is pulled
+        # off the true axis by degrees. See fusion.image_axis.
+        fit = fusion.image_axis(mask, contour)
+        if fit is None:
+            return None
+        ends = [np.array(fit.ends[0]), np.array(fit.ends[1])]
+        elongation = fit.elongation
 
         boards = [self.calib.to_board_mm(tuple(e)) for e in ends]
         radii = [geo.radius_of(*b) for b in boards]
@@ -282,7 +288,11 @@ class DartDetector:
         # at the edge of frame - an arm reaching in, someone walking past, a
         # shifting shadow - otherwise lands in the visit as a phantom MISS.
         # A dart in the number ring is still a legitimate zero.
-        if radii[pick] > geo.R_BOARD:
+        #
+        # When a second view is going to correct this point, the margin gives
+        # fusion room to pull a borderline reading back onto the board; the hard
+        # reject is then applied to the fused answer instead.
+        if radii[pick] > geo.R_BOARD + self.reject_margin_mm:
             return None
 
         score = geo.score_at(*board_mm)
@@ -298,4 +308,7 @@ class DartDetector:
             confidence *= 0.80
 
         return Dart(tip_image=tip, board_mm=board_mm, score=score, area=area,
-                    elongation=elongation, confidence=round(confidence, 2))
+                    elongation=elongation, confidence=round(confidence, 2),
+                    axis_image=tuple(float(v) for v in fit.line),
+                    ends_image=(fit.ends[0], fit.ends[1]),
+                    axis_sigma_deg=fit.sigma_deg)

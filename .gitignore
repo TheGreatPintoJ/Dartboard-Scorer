@@ -5,3 +5,7 @@ config.json
 calibration.json
 calibration.reference.png
 throws.csv
+
+*.pub
+*.key
+Screen Recording*

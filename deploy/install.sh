@@ -38,7 +38,7 @@ usermod -aG video "$USERNAME"
 echo "==> code -> $PREFIX"
 install -d -o "$USERNAME" -g "$USERNAME" "$PREFIX" "$STATE"
 rsync -a --delete \
-  --exclude '.venv' --exclude '__pycache__' --exclude '.git' \
+  --exclude '.venv' --exclude '__pycache__' \
   --exclude 'config.json' --exclude 'calibration.json' --exclude '*.csv' \
   "$HERE"/ "$PREFIX"/
 chown -R "$USERNAME:$USERNAME" "$PREFIX"

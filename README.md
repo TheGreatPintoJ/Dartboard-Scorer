@@ -124,11 +124,42 @@ two references:
 Nothing is measured until the image has held still for a few frames, so darts in
 flight and hands in shot never produce a score.
 
-**Finding the point.** The new blob is the dart. Its principal axis is the shaft;
-the two ends of that axis are the point and the flight. The barrel always extends
-away from the centre of the board, so the end nearer the bull is the point. The
-last few pixels at that end are averaged, which keeps the answer stable to about
-1.5 mm - comfortably finer than the 8 mm treble ring.
+**Finding the point.** The new blob is the dart. Its axis is the shaft - fitted
+to the blob's pixels weighted by inverse thickness, so the wide flight does not
+drag the line off the thin barrel - and the two ends of that axis are the point
+and the flight. The barrel always extends away from the centre of the board, so
+the end nearer the bull is the point. The last few pixels at that end are
+averaged, which keeps the answer stable to about 1.5 mm - comfortably finer than
+the 8 mm treble ring.
+
+**Finding the point, with two cameras.** The single-camera answer above has a
+built-in bias: the end of the *visible* blob is not the point, it is a few
+millimetres up the shaft, standing proud of the board. Perspective then carries
+that reading sideways, and the further off-axis the camera sits, the worse it is.
+
+The dart's point is stuck *in* the board, so it lies on the board plane. Push the
+dart's whole image axis through the homography and you get the shadow the dart
+casts on the board from that camera - and the point lies on its own shadow, from
+every viewpoint. So two shadows cross at the point:
+
+    L = G.T @ line          # G maps board millimetres to image pixels
+    point = L1 x L2
+
+That needs no lens calibration, no relative pose between the cameras and no new
+setup step - only the four-click calibration each camera already needs. Using a
+wrong focal length would distort the reconstruction by a map that leaves the
+board plane alone, so it cannot change where the shadows cross.
+
+It also extrapolates the shaft through a buried or occluded point, and it turns
+"tip end" from a guess into a measurement: whichever end of a view's shadow is
+nearer the crossing is the point.
+
+Two things it cannot do. Shadows that cross at a shallow angle - a dart lying
+almost flat, or two cameras too close together - give an answer wildly sensitive
+to noise, so those fall back to a single view. And if fusing moves the point more
+than 30 mm, the single-view answer is kept instead, which bounds the worst case
+to no worse than one camera. `tests/test_fusion.py` measures the whole thing on
+synthetic 3D darts.
 
 A blob whose point falls outside the physical board is discarded rather than
 scored: an arm reaching in, someone walking past or a shifting shadow cannot be
@@ -285,6 +316,9 @@ python -m dart_scorer doctor      # camera, machine and stream diagnostics
 python tests/test_camera.py       # capture layer: drain thread, controls, v4l2
 python tests/test_detector.py     # tip-end selection on known throws
 python tests/test_webapp.py       # the live service, end to end, no camera
+python tests/test_fusion.py       # two-view geometry and its fallbacks
+python tests/test_calibration.py  # board lines, frame-size mismatches
+python tests/test_engine.py       # the scoring thread survives a bad camera
 ```
 
 `test_webapp.py` starts the real server on a spare port, throws darts at the
@@ -294,8 +328,9 @@ demo board and checks the HTTP surface reports them.
 
 - **One camera cannot see depth.** A dart at a steep angle is measured where its
   point *appears*, so an extreme angle can read a millimetre or two off. The fix
-  is a second camera at ~90 degrees, intersecting two rays - the geometry and
-  calibration support that; the fusion step is not written.
+  is a second camera at ~90 degrees; the geometry for it is written and tested in
+  `fusion.py` (see "Finding the point, with two cameras"), but opening two cameras at once and
+  matching a dart between them is not - so today this remains a real limit.
 - **A dart hidden behind another** will not be seen as a separate blob. It is
   logged as a low-confidence detection rather than silently scored wrong.
 - **Wire calls** are flagged, not resolved.
@@ -310,6 +345,7 @@ dart_scorer/
   geometry.py     board dimensions, bed order, point -> score
   calibration.py  camera <-> board homography, save/load, board outline finder
   detector.py     background differencing, settle logic, tip estimation
+  fusion.py       dart axis fitting, and two views intersected on the board
   session.py      visits, 3-dart turns, X01 with double-out
   camera.py       opening a camera: pixel format, drain thread, focus/zoom/...
   diagnose.py     the doctor: per-stage timing, wrap detection, verdicts
@@ -317,7 +353,7 @@ dart_scorer/
   webapp.py       HTTP routes, MJPEG stream, server-sent events
   web/index.html  the browser interface
   config.py       runtime settings, persisted to config.json
-  synthetic.py    the demo board, used by the tests and --source demo
+  synthetic.py    the demo board and 3D cameras, for the tests and --source demo
   render.py       board drawing and the live overlay
   main.py         serve / calibrate / run / selftest / board
 deploy/
