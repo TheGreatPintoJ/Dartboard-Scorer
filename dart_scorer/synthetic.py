@@ -110,17 +110,22 @@ def look_at(distance_mm, azimuth_deg, elevation_deg, fov_deg, width, height):
                                 -np.cos(el) * np.sin(az),
                                 np.sin(el)])
     f = -c / np.linalg.norm(c)                       # towards the bull
-    up_hint = np.array([0.0, -1.0, 0.0])             # -y is up on the board
-    r = np.cross(f, up_hint)
-    if np.linalg.norm(r) < 1e-9:                     # looking straight down +y
-        r = np.cross(f, np.array([0.0, 0.0, 1.0]))
-    r /= np.linalg.norm(r)
-    u = np.cross(r, f)
+    # The camera's own axes, in board coordinates: x right across the frame,
+    # y *down* the frame, z forward. Building y from x and f (rather than the
+    # other way round) is what keeps the rendered board the right way up - the
+    # board frame has +y already pointing down, and +z out towards the thrower,
+    # so the usual right-handed cross-product order renders it upside down.
+    up_board = np.array([0.0, -1.0, 0.0])
+    x = np.cross(up_board, f)
+    if np.linalg.norm(x) < 1e-9:                     # looking straight along y
+        x = np.cross(np.array([0.0, 0.0, 1.0]), f)
+    x /= np.linalg.norm(x)
+    y = np.cross(x, f)
     fx = (width / 2.0) / np.tan(np.radians(fov_deg) / 2.0)
     K = np.array([[fx, 0.0, width / 2.0],
                   [0.0, fx, height / 2.0],
                   [0.0, 0.0, 1.0]])
-    return Camera3D(K, np.vstack([r, u, f]), c)
+    return Camera3D(K, np.vstack([x, y, f]), c)
 
 
 def synthetic_camera_3d(width=1280, height=720, *, distance_mm=1200.0,
@@ -246,13 +251,16 @@ class DemoSource:
     hardware attached.
     """
 
-    def __init__(self, width=960, height=720, fps=30.0):
+    def __init__(self, width=960, height=720, fps=30.0, stream="rgb"):
         self._board, self._view, self.calibration = synthetic_camera(width, height)
         self._canvas = self._board.copy()
         self._lock = threading.Lock()
         self._interval = 1.0 / max(fps, 1.0)
         self._next = 0.0
-        self.name = "demo"
+        # Pretending to be a Kinect's other cameras, so the stream selector and
+        # everything downstream of it can be exercised with nothing plugged in.
+        self.stream = stream if stream in ("rgb", "ir", "depth") else "rgb"
+        self.name = "demo" if self.stream == "rgb" else f"demo:{self.stream}"
         self.darts: list[str] = []
         self._dirty = True
         self._warped: np.ndarray | None = None
@@ -266,9 +274,29 @@ class DemoSource:
             # The board only changes when a dart lands or the darts come out,
             # so the perspective warp is cached; only the noise is per frame.
             if self._dirty or self._warped is None:
-                self._warped = self._view.warp(self._canvas)
+                self._warped = self._as_stream(self._view.warp(self._canvas))
                 self._dirty = False
             return self._view.noise(self._warped)
+
+    def _as_stream(self, frame):
+        """Fake what a Kinect's infrared or depth camera would hand back.
+
+        Infrared is a monochrome view lit by the sensor's own emitter, so it is
+        the colour view with the colour taken out. Depth is flat across the
+        board because the board *is* flat - which is exactly why depth is good
+        at spotting a dart standing out of it, and useless for saying where on
+        the board that dart landed.
+        """
+        if self.stream == "rgb":
+            return frame
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if self.stream == "ir":
+            return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        lit = cv2.GaussianBlur(gray, (9, 9), 0)
+        board = (lit > 8).astype(np.uint8) * 150      # the board face, one plane
+        proud = (cv2.absdiff(gray, lit) > 18).astype(np.uint8) * 105
+        return cv2.cvtColor(np.clip(board + proud, 0, 255).astype(np.uint8),
+                            cv2.COLOR_GRAY2BGR)
 
     def throw(self, label: str, jitter_deg: float = 5.0) -> str:
         x, y = target_for_label(label)

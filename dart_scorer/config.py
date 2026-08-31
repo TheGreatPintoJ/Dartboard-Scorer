@@ -9,6 +9,37 @@ from pathlib import Path
 DEFAULT_CONFIG_PATH = "config.json"
 
 
+STREAMS = ("rgb", "ir", "depth")
+ROTATIONS = (0, 90, 180, 270)
+
+
+@dataclass
+class Placement:
+    """Where a camera sits in relation to the board.
+
+    Angles use the board's own convention (see geometry.py): bearing 0 is off to
+    the right of the board, 90 straight above it, 180 to the left, 270 below.
+    Elevation is the angle up out of the board's plane - 0 means level with the
+    face, looking straight across it, 90 means square on.
+
+    These are what you *expect*; the real values are measured from the
+    calibration by calibration.measure_pose, and the two being far apart is how
+    you find out a camera has been knocked. Distance is the exception: it cannot
+    be derived without a focal length, so it is only ever what you type, and is
+    used for guidance (a Kinect closer than 800 mm returns holes, not depth).
+    """
+
+    bearing_deg: float = 0.0
+    elevation_deg: float = 25.0
+    distance_mm: float = 1200.0
+    # Applied to incoming frames, for a camera that is physically mounted
+    # sideways. Changing it moves the board in frame, so it invalidates the
+    # calibration exactly like zoom does.
+    rotate: int = 0            # 0 | 90 | 180 | 270
+    flip_h: bool = False
+    flip_v: bool = False
+
+
 @dataclass
 class CameraConfig:
     source: str = "0"          # camera index, video file, URL, or "demo"
@@ -33,6 +64,16 @@ class CameraConfig:
     # is left exactly as the camera had it.
     controls: dict = field(default_factory=dict)
 
+    # --- per-view identity and geometry ---------------------------------- #
+    name: str = "primary"
+    # Which of a Kinect's cameras to read. Ignored by an ordinary webcam.
+    # rgb and ir are physically different sensors about 25 mm apart, so they do
+    # not share a homography: switching means recalibrating.
+    stream: str = "rgb"        # rgb | ir | depth
+    # Blank means calibration.<name>.json, so views cannot collide.
+    calibration_path: str = ""
+    placement: Placement = field(default_factory=Placement)
+
 
 @dataclass
 class DetectorConfig:
@@ -43,7 +84,8 @@ class DetectorConfig:
     motion_threshold: int = 120
     learn_frames: int = 25
     min_elongation: float = 2.0
-    tip_mode: str = "centre"
+    # "auto" works it out from where the calibration says the camera is.
+    tip_mode: str = "auto"
 
 
 @dataclass
@@ -86,12 +128,29 @@ class AppConfig:
     detector: DetectorConfig = field(default_factory=DetectorConfig)
     game: GameConfig = field(default_factory=GameConfig)
     fusion: FusionConfig = field(default_factory=FusionConfig)
+    # The *additional* views. `camera` above is the primary one, and stays where
+    # it is so that /api/config, the --source flag and every existing caller
+    # keep working; the UI is handed a uniform list either way (see `views_all`).
+    views: list[CameraConfig] = field(default_factory=list)
     calibration_path: str = "calibration.json"
     log_path: str = "throws.csv"
 
     # ------------------------------------------------------------------ #
     def to_dict(self) -> dict:
         return asdict(self)
+
+    def views_all(self) -> list[CameraConfig]:
+        """Every view, primary first. The order the UI shows them in."""
+        return [self.camera] + list(self.views)
+
+    def view(self, name: str | None) -> CameraConfig | None:
+        """Look a view up by name; no name means the primary."""
+        if not name:
+            return self.camera
+        for v in self.views_all():
+            if v.name == name:
+                return v
+        return None
 
     @classmethod
     def from_dict(cls, data: dict) -> "AppConfig":
@@ -116,20 +175,43 @@ class AppConfig:
                     if is_dataclass(getattr(self, f.name))}
         for key, value in (patch or {}).items():
             if key in sections and isinstance(value, dict):
-                section = sections[key]
-                allowed = {f.name for f in fields(section)}
-                for name, raw in value.items():
-                    if name not in allowed:
-                        continue
-                    current = getattr(section, name)
-                    new = _coerce(current, raw)
-                    if new != current:
-                        setattr(section, name, new)
-                        changed.append(f"{key}.{name}")
+                changed += _merge(sections[key], value, key)
+            elif key == "views" and isinstance(value, list):
+                changed += self._merge_views(value)
             elif key in ("calibration_path", "log_path") and isinstance(value, str):
                 if getattr(self, key) != value:
                     setattr(self, key, value)
                     changed.append(key)
+        return changed
+
+    def _merge_views(self, patch: list) -> list[str]:
+        """Merge a list of extra views, matched by name.
+
+        Matching by name rather than position means the browser can send the
+        views in any order, and adding one does not renumber the rest. A view
+        given as null (or with ``"remove": true``) is dropped - that is how the
+        UI deletes one.
+        """
+        changed: list[str] = []
+        by_name = {v.name: v for v in self.views}
+        for entry in patch:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or "").strip()
+            if not name or name == self.camera.name:
+                continue                      # the primary is patched as `camera`
+            if entry.get("remove"):
+                if by_name.pop(name, None) is not None:
+                    self.views = [v for v in self.views if v.name != name]
+                    changed.append(f"views.{name}.remove")
+                continue
+            view = by_name.get(name)
+            if view is None:
+                view = CameraConfig(name=name)
+                self.views.append(view)
+                by_name[name] = view
+                changed.append(f"views.{name}.added")
+            changed += _merge(view, entry, f"views.{name}")
         return changed
 
     def save(self, path: str | Path) -> None:
@@ -141,6 +223,33 @@ class AppConfig:
         if not p.exists():
             return cls()
         return cls.from_dict(json.loads(p.read_text(encoding="utf-8")))
+
+
+def _merge(section, patch: dict, prefix: str) -> list[str]:
+    """Merge a dict into one dataclass section, reporting what moved.
+
+    Nested dataclasses (a view's `placement`) recurse, so the dotted names come
+    back as e.g. "views.kinect.placement.bearing_deg".
+    """
+    changed = []
+    allowed = {f.name for f in fields(section)}
+    for name, raw in (patch or {}).items():
+        if name not in allowed:
+            continue
+        current = getattr(section, name)
+        if is_dataclass(current):
+            if isinstance(raw, dict):
+                changed += _merge(current, raw, f"{prefix}.{name}")
+            continue
+        new = _coerce(current, raw)
+        if name == "stream" and new not in STREAMS:
+            continue
+        if name == "rotate" and new not in ROTATIONS:
+            continue
+        if new != current:
+            setattr(section, name, new)
+            changed.append(f"{prefix}.{name}")
+    return changed
 
 
 def _coerce(current, raw):

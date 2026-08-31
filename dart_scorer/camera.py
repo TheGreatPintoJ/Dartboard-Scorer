@@ -48,6 +48,45 @@ CONTROLS: dict[str, int] = {
 # longer describes where the board is.
 GEOMETRY_CONTROLS = frozenset({"zoom", "pan", "tilt"})
 
+_ROTATE_CODES = {
+    90: cv2.ROTATE_90_CLOCKWISE,
+    180: cv2.ROTATE_180,
+    270: cv2.ROTATE_90_COUNTERCLOCKWISE,
+}
+
+
+def orient_frame(frame, placement):
+    """Rotate and flip a frame to undo how the camera is physically mounted.
+
+    Done here so that nothing downstream - detection, calibration, the browser
+    stream - ever has to know the camera is on its side. Note a 90 or 270 turn
+    swaps width and height, which is why this counts as invalidating the
+    calibration in the same way zoom does.
+    """
+    if frame is None or placement is None:
+        return frame
+    code = _ROTATE_CODES.get(int(getattr(placement, "rotate", 0) or 0))
+    if code is not None:
+        frame = cv2.rotate(frame, code)
+    flip_h = bool(getattr(placement, "flip_h", False))
+    flip_v = bool(getattr(placement, "flip_v", False))
+    if flip_h and flip_v:
+        frame = cv2.flip(frame, -1)
+    elif flip_h:
+        frame = cv2.flip(frame, 1)
+    elif flip_v:
+        frame = cv2.flip(frame, 0)
+    return frame
+
+
+def orients(placement) -> bool:
+    """True when this placement actually changes the frame."""
+    if placement is None:
+        return False
+    return bool(int(getattr(placement, "rotate", 0) or 0)
+                or getattr(placement, "flip_h", False)
+                or getattr(placement, "flip_v", False))
+
 BACKENDS: dict[str, int] = {
     "any": cv2.CAP_ANY,
     "dshow": getattr(cv2, "CAP_DSHOW", cv2.CAP_ANY),
@@ -109,7 +148,8 @@ def open_capture(cfg):
     # A file is not live: read it at the pace the caller asks for.
     live = is_index or "://" in source
     return CameraSource(cap, source, drain=live,
-                        index=int(source) if is_index else None)
+                        index=int(source) if is_index else None,
+                        orient=getattr(cfg, "placement", None))
 
 
 # OpenCV can set a control but cannot say what range it accepts, so the web UI
@@ -202,10 +242,11 @@ class CameraSource:
     """
 
     def __init__(self, cap, name: str, drain: bool = False,
-                 index: int | None = None) -> None:
+                 index: int | None = None, orient=None) -> None:
         self._cap = cap
         self.name = name
         self._index = index
+        self._orient = orient
         self._ranges: dict | None = None        # looked up once, then cached
         self._cap_lock = threading.Lock()      # VideoCapture is not thread-safe
         self._latest = None
@@ -231,7 +272,7 @@ class CameraSource:
         if self._thread is None:
             with self._cap_lock:
                 ok, frame = self._cap.read()
-            return frame if ok else None
+            return orient_frame(frame, self._orient) if ok else None
         # Hand back each frame once, so the caller keeps the camera's own
         # pacing instead of spinning on a frame it has already scored.
         deadline = time.monotonic() + 2.0
@@ -239,7 +280,7 @@ class CameraSource:
             with self._latest_lock:
                 frame, self._latest = self._latest, None
             if frame is not None:
-                return frame
+                return orient_frame(frame, self._orient)
             time.sleep(0.002)
         return None                            # camera has gone away
 
@@ -297,11 +338,20 @@ class CameraSource:
         """What the camera is really doing, as opposed to what we asked for."""
         with self._cap_lock:
             get = self._cap.get
-            return {
-                "width": int(get(cv2.CAP_PROP_FRAME_WIDTH) or 0),
-                "height": int(get(cv2.CAP_PROP_FRAME_HEIGHT) or 0),
+            width = int(get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            height = int(get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            info = {
+                "width": width,
+                "height": height,
                 "fps": round(float(get(cv2.CAP_PROP_FPS) or 0), 1),
                 "fourcc": fourcc_name(get(cv2.CAP_PROP_FOURCC) or 0),
                 "buffer_size": int(get(cv2.CAP_PROP_BUFFERSIZE) or 0),
                 "backend": self._cap.getBackendName(),
             }
+        # Report the frame as the rest of the app will see it: a quarter turn
+        # swaps the axes, and the calibration is checked against these numbers.
+        rotate = int(getattr(self._orient, "rotate", 0) or 0)
+        if rotate in (90, 270):
+            info["width"], info["height"] = height, width
+        info["rotate"] = rotate
+        return info

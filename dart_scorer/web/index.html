@@ -93,6 +93,24 @@
   .ctl.unsupported { opacity: .45; }
   .ctl input[type=checkbox] { justify-self: start; width: auto; }
   .ctl input[type=range] { width: 100%; padding: 0; background: none; border: none; }
+  .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line);
+          margin: -4px 0 14px; flex-wrap: wrap; }
+  .tab { background: none; border: none; border-bottom: 2px solid transparent;
+         border-radius: 0; padding: 8px 12px; color: var(--muted);
+         font-size: 13px; text-transform: uppercase; letter-spacing: .08em;
+         font-weight: 600; }
+  .tab:hover { color: var(--text); }
+  .tab[aria-selected=true] { color: var(--text); border-bottom-color: var(--accent); }
+  .views { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+  .view-chip { font-size: 12px; padding: 5px 12px; border-radius: 999px; }
+  .view-chip[aria-selected=true] { border-color: var(--accent); color: var(--text); }
+  /* Expected beside measured, so a camera that has moved is obvious at a glance
+     rather than something you have to go looking for. */
+  .measured { display: grid; grid-template-columns: 1fr auto auto; gap: 6px 12px;
+              align-items: baseline; margin-top: 10px; font-size: 13px; }
+  .measured .lbl { color: var(--muted); }
+  .measured .val { font-variant-numeric: tabular-nums; text-align: right; }
+  .measured .val.off { color: var(--warn); }
   .toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
            background: #2f3540; border: 1px solid var(--line); padding: 9px 16px;
            border-radius: 9px; opacity: 0; transition: opacity .25s; z-index: 9; }
@@ -133,30 +151,6 @@
       </p>
     </div>
 
-    <div class="card" id="camera-card">
-      <details id="camera-details" open>
-        <summary>Camera controls</summary>
-        <div class="row" style="margin-top:12px">
-          <span class="pill" id="cam-actual">not open</span>
-          <button id="btn-cam-refresh">Refresh</button>
-          <button id="btn-lock-focus">Lock focus &amp; white balance</button>
-        </div>
-        <p class="hint" id="cam-warn" hidden></p>
-        <div id="controls" class="controls"></div>
-        <p class="hint">
-          Each row shows what the camera <b>actually</b> reports after a change -
-          cameras routinely accept a value and then ignore or clamp it, so if the
-          reading does not move, that camera does not support that control.
-          Controls appear as sliders where the driver publishes a real range
-          (Linux, via <code>v4l2-ctl</code>) and as boxes otherwise; blank a box
-          to stop setting that control at all.
-          <b>Autofocus and auto-exposure should be off</b> while scoring: both
-          hunt, which pulses the picture and shifts the reference frame the
-          detector compares against.
-        </p>
-      </details>
-    </div>
-
     <div class="card" id="demo-card" hidden>
       <h2>Demo board</h2>
       <div class="row">
@@ -174,6 +168,13 @@
   </section>
 
   <section>
+    <div class="tabs" role="tablist">
+      <button class="tab" data-tab="game" role="tab" aria-selected="true">Game</button>
+      <button class="tab" data-tab="cameras" role="tab" aria-selected="false">Cameras</button>
+      <button class="tab" data-tab="detection" role="tab" aria-selected="false">Detection</button>
+    </div>
+
+    <div data-panel="game">
     <div class="card">
       <h2>This visit</h2>
       <div class="visit" id="visit"></div>
@@ -198,11 +199,80 @@
     </div>
 
     <div class="card">
-      <details id="settings">
-        <summary>Settings</summary>
+      <h2>Activity</h2>
+      <div id="log"></div>
+    </div>
+    </div><!-- /game -->
 
-        <h2 style="margin-top:14px">Camera</h2>
+    <div data-panel="cameras" hidden>
+    <div class="card">
+      <h2>Cameras</h2>
+      <div class="views" id="view-chips"></div>
+      <div class="row">
+        <button id="btn-add-view">Add a camera</button>
+        <button id="btn-remove-view" class="danger" hidden>Remove this one</button>
+        <span class="pill" id="view-role">-</span>
+      </div>
+      <p class="hint" id="fusion-note"></p>
+    </div>
+
+    <div class="card">
+      <details id="placement-card" open>
+        <summary>Where this camera is</summary>
         <div class="grid2">
+          <label class="field">Bearing round the board (deg)
+            <input id="pl-bearing" type="number" step="1" min="0" max="360"></label>
+          <label class="field">Height above the board plane (deg)
+            <input id="pl-elevation" type="number" step="1" min="0" max="90"></label>
+          <label class="field">Distance from the board (mm)
+            <input id="pl-distance" type="number" step="10" min="100"></label>
+          <label class="field">Turn the picture
+            <select id="pl-rotate">
+              <option value="0">none</option>
+              <option value="90">90&deg; clockwise</option>
+              <option value="180">180&deg;</option>
+              <option value="270">90&deg; anticlockwise</option>
+            </select></label>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <label class="check"><input type="checkbox" id="pl-fliph"> mirror left-right</label>
+          <label class="check"><input type="checkbox" id="pl-flipv"> mirror top-bottom</label>
+        </div>
+
+        <div class="measured" id="pl-measured"></div>
+        <p class="hint" id="pl-warn" hidden></p>
+        <div class="row" style="margin-top:12px">
+          <button id="btn-save-view" class="primary">Apply &amp; save</button>
+        </div>
+        <p class="hint">
+          <b>Bearing</b> is where the camera sits around the board face: 0 is off
+          to the right, 90 straight above, 180 to the left, 270 below.
+          <b>Height</b> is the angle up out of the board's plane - 0 means looking
+          straight across the face, 90 means square on to it.
+          Once the board is calibrated these are <b>measured from the picture</b>
+          and shown beside what you typed; the two drifting apart means the camera
+          has been knocked, or is not the one you think it is. Distance is the
+          exception - it cannot be worked out from the picture, so it is only ever
+          what you enter, and is used to warn about a Kinect placed too close.
+          Turning the picture moves the board within the frame, so it needs a
+          fresh calibration afterwards.
+        </p>
+      </details>
+    </div>
+
+    <div class="card">
+      <details id="capture-card">
+        <summary>What this camera captures</summary>
+        <div class="grid2" style="margin-top:12px">
+          <label class="field">Stream
+            <select id="cfg-stream">
+              <option value="rgb">colour</option>
+              <option value="ir">infrared</option>
+              <option value="depth">depth</option>
+            </select></label>
+        </div>
+        <p class="hint" id="stream-note"></p>
+        <div class="grid2" style="margin-top:12px">
           <label class="field">Source
             <input id="cfg-source" placeholder="0, /dev/video0, URL, demo"></label>
           <label class="field">Width <input id="cfg-width" type="number"></label>
@@ -231,8 +301,43 @@
         </div>
         <div class="row"><button id="btn-cameras">Find cameras</button>
           <span class="pill" id="cameras">-</span></div>
+        <div class="row" style="margin-top:12px">
+          <button id="btn-apply-capture" class="primary">Apply &amp; save</button>
+        </div>
+      </details>
+    </div>
 
-        <h2 style="margin-top:16px">Detection</h2>
+    <div class="card" id="camera-card">
+      <details id="camera-details">
+        <summary>Camera controls</summary>
+        <div class="row" style="margin-top:12px">
+          <span class="pill" id="cam-actual">not open</span>
+          <button id="btn-cam-refresh">Refresh</button>
+          <button id="btn-lock-focus">Lock focus &amp; white balance</button>
+        </div>
+        <p class="hint" id="cam-warn" hidden></p>
+        <div id="controls" class="controls"></div>
+        <p class="hint">
+          Each row shows what the camera <b>actually</b> reports after a change -
+          cameras routinely accept a value and then ignore or clamp it, so if the
+          reading does not move, that camera does not support that control.
+          Controls appear as sliders where the driver publishes a real range
+          (Linux, via <code>v4l2-ctl</code>) and as boxes otherwise; blank a box
+          to stop setting that control at all.
+          <b>Autofocus and auto-exposure should be off</b> while scoring: both
+          hunt, which pulses the picture and shifts the reference frame the
+          detector compares against.
+        </p>
+      </details>
+    </div>
+    </div><!-- /cameras -->
+
+    <div data-panel="detection" hidden>
+    <div class="card">
+      <details id="settings" open>
+        <summary>Detection &amp; game</summary>
+
+        <h2 style="margin-top:14px">Detection</h2>
         <div class="grid2">
           <label class="field">Change threshold <input id="cfg-diff" type="number"></label>
           <label class="field">Min blob px <input id="cfg-minarea" type="number"></label>
@@ -241,6 +346,7 @@
           <label class="field">Motion px <input id="cfg-motion" type="number"></label>
           <label class="field">Tip end
             <select id="cfg-tip">
+              <option value="auto">automatic - from where the camera is</option>
               <option value="centre">nearer the bull (default)</option>
               <option value="lowest">lowest - camera above the board</option>
               <option value="highest">highest - camera below the board</option>
@@ -270,15 +376,13 @@
           <button id="btn-apply" class="primary">Apply &amp; save</button>
           <a href="/api/throws.csv" download><button type="button">Download log</button></a>
         </div>
-        <p class="hint">Changing the camera reopens it; changing detection or game
-          settings restarts the current game.</p>
+        <p class="hint">Changing detection or game settings restarts the current
+          game. <b>Tip end</b> decides which end of the dart's blob is the point;
+          on "automatic" it is worked out from where the calibration says the
+          camera is, so there is nothing to get wrong.</p>
       </details>
     </div>
-
-    <div class="card">
-      <h2>Activity</h2>
-      <div id="log"></div>
-    </div>
+    </div><!-- /detection -->
   </section>
 </main>
 
@@ -568,7 +672,6 @@ $("btn-lock-focus").onclick = () => {
 $("camera-details").addEventListener("toggle", () => {
   if ($("camera-details").open && !cameraInfo) loadCamera();
 });
-loadCamera();
 
 /* ------------------------------------------------------------- commands */
 async function command(name, extra = {}) {
@@ -589,22 +692,205 @@ $("btn-cameras").onclick = async () => {
   $("cameras").textContent = "scanning...";
   try {
     const data = await api("/api/cameras");
-    $("cameras").textContent = data.cameras.length
-      ? "found: " + data.cameras.join(", ") : "none found";
+    const found = data.devices || [];
+    $("cameras").textContent = found.length
+      ? "found: " + found.map((d) => d.label).join(", ") : "none found";
   } catch (err) { $("cameras").textContent = "failed"; }
 };
 
-$("btn-apply").onclick = async () => {
-  const patch = {
-    camera: {
-      source: $("cfg-source").value, width: +$("cfg-width").value,
-      height: +$("cfg-height").value, fourcc: $("cfg-fourcc").value,
-      fps: +$("cfg-fps").value, backend: $("cfg-backend").value,
-      buffer_size: +$("cfg-buffer").value,
-      stream_quality: +$("cfg-quality").value,
-      stream_scale: +$("cfg-scale").value,
-      stream_fps: +$("cfg-streamfps").value,
+// --- tabs ------------------------------------------------------------------
+// Only the right-hand column is tabbed. The video stays put on the left,
+// because drawOverlay() bails out on a zero-width image and hiding the <img>
+// can tear down the MJPEG stream - so the calibration flow would break.
+function showTab(name) {
+  document.querySelectorAll("[data-tab]").forEach((t) =>
+    t.setAttribute("aria-selected", String(t.dataset.tab === name)));
+  document.querySelectorAll("[data-panel]").forEach((p) =>
+    p.hidden = p.dataset.panel !== name);
+  if (name === "cameras") loadViews();
+  drawOverlay();
+}
+document.querySelectorAll("[data-tab]").forEach((t) => {
+  t.onclick = () => showTab(t.dataset.tab);
+});
+
+// --- cameras tab -----------------------------------------------------------
+let viewsInfo = null;
+let selectedView = null;
+let placementTouched = false;
+["placement-card", "capture-card"].forEach((id) =>
+  $(id).addEventListener("input", () => placementTouched = true));
+
+function currentView() {
+  if (!viewsInfo) return null;
+  return viewsInfo.views.find((v) => v.name === selectedView)
+      || viewsInfo.views[0] || null;
+}
+
+async function loadViews() {
+  try { renderViews(await api("/api/views")); }
+  catch (err) { toast(err.message, true); }
+}
+
+function renderViews(info) {
+  viewsInfo = info;
+  const view = currentView();
+  if (!view) return;
+  selectedView = view.name;
+
+  const chips = $("view-chips");
+  chips.innerHTML = "";
+  for (const v of info.views) {
+    const chip = document.createElement("button");
+    chip.className = "pill view-chip";
+    chip.textContent = v.name + (v.calibrated ? "" : " (uncalibrated)");
+    chip.setAttribute("aria-selected", String(v.name === selectedView));
+    chip.onclick = () => {
+      selectedView = v.name;
+      placementTouched = false;
+      renderViews(viewsInfo);
+      liveVideo();
+    };
+    chips.appendChild(chip);
+  }
+
+  $("view-role").textContent = view.role + (view.open ? " - open" : " - not open");
+  $("view-role").className = "pill " + (view.open ? "ok" : "warn");
+  $("btn-remove-view").hidden = view.role === "primary";
+
+  const fusion = info.fusion || {};
+  const outlook = fusion.reason
+    ? (fusion.ready ? fusion.reason : `<b>${fusion.reason}</b>`) : "";
+  // Be straight about it: only the primary is opened today, so the video on the
+  // left is still that one whichever chip is selected here. Everything else on
+  // this tab is real - it is the settings a second camera will be opened with.
+  const notYet = view.role !== "primary"
+    ? " Only the first camera is opened at the moment, so the video on the left"
+      + " is still that one; these settings are stored ready for it."
+    : "";
+  $("fusion-note").innerHTML = outlook + notYet;
+
+  fillPlacement(view);
+  renderMeasured(view);
+
+  // A Kinect is three cameras in one; an ordinary webcam has nothing to pick.
+  const k = info.kinect || {};
+  const sel = $("cfg-stream");
+  sel.disabled = !view.kinect;
+  sel.title = view.kinect ? "" : "only a Kinect has more than one camera";
+  $("stream-note").innerHTML = !view.kinect
+    ? "This source is an ordinary camera, so there is only the one picture to take."
+    : k.available
+      ? "Colour is the most detailed. <b>Infrared</b> is lit by the Kinect's own "
+        + "emitter, so it does not care whether the room lights are on. "
+        + "<b>Depth</b> sees the dart standing out of the board rather than merely "
+        + "looking different from it. Colour and infrared are different sensors "
+        + "about 25 mm apart, so <b>switching means calibrating again</b>."
+      : `<b>No Kinect available: ${k.reason || "libfreenect is not installed"}</b>`;
+}
+
+function fillPlacement(view) {
+  if (placementTouched) return;              // do not fight the operator
+  const p = view.placement;
+  $("pl-bearing").value = p.bearing_deg;
+  $("pl-elevation").value = p.elevation_deg;
+  $("pl-distance").value = p.distance_mm;
+  $("pl-rotate").value = String(p.rotate);
+  $("pl-fliph").checked = p.flip_h;
+  $("pl-flipv").checked = p.flip_v;
+  $("cfg-stream").value = view.stream;
+  $("cfg-source").value = view.source;
+}
+
+function renderMeasured(view) {
+  const box = $("pl-measured");
+  const m = view.measured;
+  if (!m) {
+    box.innerHTML = `<span class="lbl">Measured</span>`
+      + `<span class="val">-</span><span class="lbl">calibrate to find out</span>`;
+  } else {
+    const drift = view.drift_deg ?? 0;
+    const row = (label, expected, measured, off) =>
+      `<span class="lbl">${label}</span>`
+      + `<span class="val">you said ${expected}</span>`
+      + `<span class="val${off ? " off" : ""}">measured ${measured}</span>`;
+    box.innerHTML =
+      row("Bearing", `${view.placement.bearing_deg}&deg;`,
+          `${m.bearing_deg}&deg;`, drift > 15)
+      + row("Height", `${view.placement.elevation_deg}&deg;`,
+            `${m.elevation_deg}&deg;`, false)
+      + row("Roll", "-", `${m.roll_deg}&deg;`, Math.abs(m.roll_deg) > 15);
+  }
+  const warn = $("pl-warn");
+  warn.hidden = !view.warnings.length;
+  warn.innerHTML = view.warnings.map((w) => `<b>${w}</b>`).join("<br>");
+}
+
+function viewPatch() {
+  return {
+    name: selectedView,
+    source: $("cfg-source").value,
+    stream: $("cfg-stream").value,
+    placement: {
+      bearing_deg: +$("pl-bearing").value,
+      elevation_deg: +$("pl-elevation").value,
+      distance_mm: +$("pl-distance").value,
+      rotate: +$("pl-rotate").value,
+      flip_h: $("pl-fliph").checked,
+      flip_v: $("pl-flipv").checked,
     },
+  };
+}
+
+async function saveView(extra = {}) {
+  try {
+    const info = await api("/api/views",
+      { method: "POST", body: JSON.stringify({ ...viewPatch(), ...extra }) });
+    placementTouched = false;
+    renderViews(info);
+    toast("Saved");
+    setTimeout(liveVideo, 400);
+  } catch (err) { toast(err.message, true); }
+}
+
+$("btn-save-view").onclick = () => saveView();
+$("btn-apply-capture").onclick = () => saveView({
+  width: +$("cfg-width").value, height: +$("cfg-height").value,
+  fourcc: $("cfg-fourcc").value, fps: +$("cfg-fps").value,
+  backend: $("cfg-backend").value, buffer_size: +$("cfg-buffer").value,
+  stream_quality: +$("cfg-quality").value, stream_scale: +$("cfg-scale").value,
+  stream_fps: +$("cfg-streamfps").value,
+});
+
+$("btn-add-view").onclick = async () => {
+  const name = prompt("A name for this camera, e.g. kinect or side");
+  if (!name) return;
+  try {
+    renderViews(await api("/api/views", {
+      method: "POST",
+      body: JSON.stringify({ name: name.trim(), add: true, source: "1" }),
+    }));
+    selectedView = name.trim();
+    placementTouched = false;
+    renderViews(viewsInfo);
+  } catch (err) { toast(err.message, true); }
+};
+
+$("btn-remove-view").onclick = async () => {
+  const name = selectedView;
+  if (!name || !confirm(`Remove the camera "${name}"?`)) return;
+  try {
+    const info = await api("/api/views",
+      { method: "POST", body: JSON.stringify({ name, remove: true }) });
+    selectedView = null;
+    renderViews(info);
+  } catch (err) { toast(err.message, true); }
+};
+
+$("btn-apply").onclick = async () => {
+  // Camera fields live in the Cameras tab now and are saved from there, so
+  // this only carries what this panel actually owns.
+  const patch = {
     detector: {
       diff_threshold: +$("cfg-diff").value, min_area: +$("cfg-minarea").value,
       max_area: +$("cfg-maxarea").value, settle_frames: +$("cfg-settle").value,
@@ -629,17 +915,20 @@ let settingsTouched = false;
 $("settings").addEventListener("input", () => settingsTouched = true);
 
 function fillSettings(cfg) {
+  // The capture fields sit in the Cameras tab and belong to whichever view is
+  // selected there, so they follow that panel's own dirty flag, not this one.
+  if (!placementTouched) {
+    $("cfg-width").value = cfg.camera.width;
+    $("cfg-height").value = cfg.camera.height;
+    $("cfg-fourcc").value = cfg.camera.fourcc;
+    $("cfg-fps").value = cfg.camera.fps;
+    $("cfg-backend").value = cfg.camera.backend;
+    $("cfg-buffer").value = cfg.camera.buffer_size;
+    $("cfg-streamfps").value = cfg.camera.stream_fps;
+    $("cfg-quality").value = cfg.camera.stream_quality;
+    $("cfg-scale").value = cfg.camera.stream_scale;
+  }
   if (settingsTouched) return;              // do not fight the operator
-  $("cfg-source").value = cfg.camera.source;
-  $("cfg-width").value = cfg.camera.width;
-  $("cfg-height").value = cfg.camera.height;
-  $("cfg-fourcc").value = cfg.camera.fourcc;
-  $("cfg-fps").value = cfg.camera.fps;
-  $("cfg-backend").value = cfg.camera.backend;
-  $("cfg-buffer").value = cfg.camera.buffer_size;
-  $("cfg-streamfps").value = cfg.camera.stream_fps;
-  $("cfg-quality").value = cfg.camera.stream_quality;
-  $("cfg-scale").value = cfg.camera.stream_scale;
   $("cfg-diff").value = cfg.detector.diff_threshold;
   $("cfg-minarea").value = cfg.detector.min_area;
   $("cfg-maxarea").value = cfg.detector.max_area;
@@ -722,10 +1011,13 @@ function connect() {
       api("/api/status").then(render).catch(() => {});
     } else if (data.type === "calibration") {
       logLine(data.points.length ? "calibration updated" : "calibration cleared");
+      if (viewsInfo) loadViews();
       api("/api/status").then(render).catch(() => {});
     } else if (data.type === "config") {
       settingsTouched = false;
+      placementTouched = false;
       if (cameraInfo) loadCamera();
+      if (viewsInfo) loadViews();
       api("/api/status").then(render).catch(() => {});
     }
   };
@@ -739,6 +1031,7 @@ function connect() {
 
 window.addEventListener("resize", drawOverlay);
 $("video").addEventListener("load", drawOverlay);
+showTab("game");
 liveVideo();
 api("/api/status").then(render).catch((err) => toast(err.message, true));
 connect();

@@ -444,8 +444,8 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--motion", type=int, default=120,
                    help="changed pixels per frame that count as movement")
     r.add_argument("--tip",
-                   choices=("centre", "lowest", "highest", "leftmost", "rightmost"),
-                   default="centre",
+                   choices=("auto", "centre", "lowest", "highest", "leftmost", "rightmost"),
+                   default="auto",
                    help="which end of the blob is the point of the dart")
     r.add_argument("--log", help="append every detection to this CSV file")
     r.add_argument("--no-display", action="store_true", help="headless")

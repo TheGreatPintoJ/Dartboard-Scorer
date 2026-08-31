@@ -140,9 +140,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._file(Path(self.engine.config.log_path), None,
                                   "text/csv; charset=utf-8")
             if path == "/api/cameras":
-                return self._json({"cameras": probe_cameras()})
+                return self._json(probe_devices())
             if path == "/api/camera":
                 return self._json(self.engine.camera_info())
+            if path == "/api/views":
+                return self._json(self.engine.views_info())
         except BrokenPipeError:
             return
         except Exception as exc:                             # keep the service up
@@ -196,6 +198,24 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(controls, dict) or not controls:
                     return self._error(HTTPStatus.BAD_REQUEST, "no controls given")
                 return self._json(self.engine.set_camera_controls(controls))
+
+            if path == "/api/views":
+                # One view at a time, named. The primary lives at config.camera
+                # so that every existing caller keeps working; the browser does
+                # not need to know that, and addresses them all the same way.
+                view = body.get("view", body)
+                name = str(view.get("name") or "").strip()
+                if not name:
+                    return self._error(HTTPStatus.BAD_REQUEST, "which view?")
+                target = self.engine.config.view(name)
+                if name == self.engine.config.camera.name:
+                    patch = {"camera": {k: v for k, v in view.items() if k != "name"}}
+                elif target is None and not view.get("add"):
+                    return self._error(HTTPStatus.NOT_FOUND, f"no view named {name!r}")
+                else:
+                    patch = {"views": [view]}
+                self.engine.apply_config(patch)
+                return self._json(self.engine.views_info())
 
             if path == "/api/command":
                 name = body.get("command", "")
@@ -293,6 +313,43 @@ def probe_cameras(limit: int = 6) -> list[int]:
             found.append(index)
         cap.release()
     return found
+
+
+def _v4l2_name(index: int) -> str:
+    """What Linux calls this camera, so the picker is not a list of numbers."""
+    try:
+        return Path(f"/sys/class/video4linux/video{index}/name").read_text().strip()
+    except OSError:
+        return ""
+
+
+def probe_devices(limit: int = 6) -> dict:
+    """Everything the operator could pick as a source.
+
+    Kinects are listed separately because they are not video4linux devices at
+    all - libfreenect talks to them over raw USB, so they never turn up as an
+    index no matter how many you scan.
+    """
+    from .kinect import kinect_status
+
+    cameras = []
+    for index in probe_cameras(limit):
+        name = _v4l2_name(index)
+        cameras.append({
+            "source": str(index),
+            "label": f"{index}: {name}" if name else str(index),
+            "kind": "kinect" if "kinect" in name.lower() else "camera",
+        })
+
+    kinect = kinect_status()
+    for device in range(kinect.get("devices", 0)):
+        cameras.append({"source": f"kinect:{device}",
+                        "label": f"Kinect v1 #{device}", "kind": "kinect"})
+
+    # Kept for anyone still reading the old shape.
+    return {"cameras": [int(c["source"]) for c in cameras
+                        if c["source"].isdigit()],
+            "devices": cameras, "kinect": kinect}
 
 
 def serve(engine, host: str = "127.0.0.1", port: int = 8080,

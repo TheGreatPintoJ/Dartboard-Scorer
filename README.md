@@ -171,6 +171,33 @@ boundary. Low-confidence calls are marked in amber - those are the ones to check
 
 ## Camera settings
 
+The right-hand column is tabbed: **Game**, **Cameras** and **Detection**.
+
+**Cameras** holds one panel per camera - what it captures, where it is, and its
+controls. Where it is matters for two reasons: which end of a dart's blob is the
+point depends on it (set **tip end** to "automatic" and it is worked out for
+you), and two cameras have to be far enough apart for their views to be worth
+combining.
+
+You only ever *type* where a camera is. Once the board is calibrated the app
+**measures** it from the picture and shows both, because a dartboard is a circle
+and a circle photographed off-axis comes out as an ellipse squashed towards
+whoever took the photo. The direction of the squash is the bearing, and how much
+it is squashed is the height - neither needs to know anything about the lens.
+Distance is the exception: a close wide-angle camera and a distant narrow one
+make the same picture, so that one is only ever what you enter, and it is used to
+warn about a Kinect placed nearer than the 800 mm it can focus at.
+
+The two drifting apart is the useful part - it means the camera has been knocked,
+or is not the one you thought it was.
+
+**Stream** applies to a Kinect, which is really three cameras in one: colour,
+infrared, and the depth map the infrared one produces. Infrared is lit by the
+Kinect's own emitter, so it does not care whether the room lights are on. Colour
+and infrared are separate sensors about 25 mm apart, so switching between them
+needs a fresh calibration. This needs `libfreenect`; without it the selector says
+so and everything else carries on as normal.
+
 **Camera controls** sits under the video: focus, zoom, exposure, auto-exposure,
 autofocus, gain, brightness, contrast, saturation, sharpness, auto white
 balance, colour temperature, pan, tilt and backlight compensation. They apply
@@ -284,7 +311,7 @@ Settings in the web UI; the CLI has matching flags.
 | max blob px | 26000 | largest; beyond 3x this the board is treated as occluded |
 | settle frames | 4 | still frames required before scoring |
 | motion px | 120 | changed pixels per frame that count as movement |
-| tip end | nearer the bull | which end of the blob is the point - see below |
+| tip end | automatic | which end of the blob is the point - see below |
 
 **Tip end** decides which end of the dart is the point. The blob is the whole
 dart, so one end is the point in the board and the other is the flight; which is
@@ -298,8 +325,11 @@ which depends on where the camera sits.
 | leftmost | the camera is off to the right |
 | rightmost | the camera is off to the left |
 
-Start with "nearer the bull". The others are for a camera mounted so close to the
-board's plane that a dart can point back towards the centre in the image.
+Leave it on **automatic**: the calibration already says where the camera is, and
+that is the only thing this depends on, so there is nothing here to get wrong.
+The manual settings are for when you disagree with it. "Nearer the bull" is right
+for almost every camera; the others are for one mounted so close to the board's
+plane that a dart can point back towards the centre in the image.
 
 If it misses darts, lower the threshold and the minimum blob size; if it invents
 them, raise both. Bolt the camera down - any shift needs re-calibration - light
@@ -319,6 +349,7 @@ python tests/test_webapp.py       # the live service, end to end, no camera
 python tests/test_fusion.py       # two-view geometry and its fallbacks
 python tests/test_calibration.py  # board lines, frame-size mismatches
 python tests/test_engine.py       # the scoring thread survives a bad camera
+python tests/test_views.py        # camera placement, measured pose, /api/views
 ```
 
 `test_webapp.py` starts the real server on a spare port, throws darts at the
@@ -346,6 +377,7 @@ dart_scorer/
   calibration.py  camera <-> board homography, save/load, board outline finder
   detector.py     background differencing, settle logic, tip estimation
   fusion.py       dart axis fitting, and two views intersected on the board
+  kinect.py       Kinect v1 colour/infrared/depth, if libfreenect is installed
   session.py      visits, 3-dart turns, X01 with double-out
   camera.py       opening a camera: pixel format, drain thread, focus/zoom/...
   diagnose.py     the doctor: per-stage timing, wrap detection, verdicts

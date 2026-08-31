@@ -18,10 +18,11 @@ import numpy as np
 
 from . import geometry as geo
 from . import render
-from .calibration import Calibration
+from .calibration import Calibration, measure_pose, tip_mode_for_bearing
 from .camera import GEOMETRY_CONTROLS, open_capture
 from .config import AppConfig
 from .detector import DartDetector
+from .kinect import is_kinect_source, kinect_status
 from .session import Session
 from .synthetic import DemoSource
 
@@ -58,8 +59,81 @@ def open_source(camera_cfg):
     """A camera, a video file, a stream URL, or the built-in demo board."""
     source = str(camera_cfg.source).strip()
     if source.lower() in ("demo", "synthetic", "test"):
-        return DemoSource(fps=30.0)
+        return DemoSource(fps=30.0, stream=getattr(camera_cfg, "stream", "rgb"))
+    if is_kinect_source(source):
+        # Imported here, never at module scope: libfreenect is optional, and a
+        # half-finished install must not stop the webcam user from serving.
+        from .kinect import open_kinect
+        return open_kinect(camera_cfg)
     return open_capture(camera_cfg)
+
+
+# How far apart two views' bearings should be. Below the minimum their shadows
+# on the board cross too shallowly to trust (see fusion.MIN_SIN_THETA); much
+# beyond the maximum and they start to disagree about which dart is which.
+GOOD_SEPARATION = (55.0, 125.0)
+DRIFT_WARN_DEG = 15.0
+
+
+def _bearing_drift(expected: dict, measured: dict | None) -> float | None:
+    """How far the camera actually is from where it was said to be."""
+    if not measured:
+        return None
+    diff = (measured["bearing_deg"] - expected["bearing_deg"] + 180.0) % 360.0 - 180.0
+    return round(abs(diff), 1)
+
+
+def _view_warnings(view, measured: dict | None) -> list[str]:
+    out = []
+    drift = _bearing_drift(
+        {"bearing_deg": view.placement.bearing_deg}, measured)
+    if drift is not None and drift > DRIFT_WARN_DEG:
+        out.append(
+            f"measured bearing is {drift:.0f} deg from the {view.placement.bearing_deg:.0f} "
+            "you entered - the camera has moved, or this is not the camera you think")
+    if is_kinect_source(view.source) and view.placement.distance_mm < 800:
+        out.append("a Kinect v1 cannot focus closer than about 800 mm; below "
+                   "that its depth comes back as holes")
+    if view.stream in ("ir", "depth") and not is_kinect_source(view.source):
+        out.append(f"{view.stream} is a Kinect stream; an ordinary camera ignores it")
+    return out
+
+
+def _fusion_outlook(views: list[dict], cfg) -> dict:
+    """Whether these cameras are placed well enough to fuse.
+
+    Worth saying at setup time rather than letting it quietly degrade later:
+    two cameras close together produce shadows that cross at a shallow angle,
+    and that is the case fusion has to refuse.
+    """
+    placed = [v for v in views
+              if (v.get("measured") or v.get("placement")) is not None]
+    if len(placed) < 2:
+        return {"ready": False, "reason": "fusion needs a second view"}
+
+    def bearing(v):
+        return (v.get("measured") or v["placement"])["bearing_deg"]
+
+    best = None
+    for i in range(len(placed)):
+        for j in range(i + 1, len(placed)):
+            gap = abs((bearing(placed[i]) - bearing(placed[j]) + 180.0) % 360.0 - 180.0)
+            pair = {"views": [placed[i]["name"], placed[j]["name"]],
+                    "separation_deg": round(gap, 1)}
+            if best is None or gap > best["separation_deg"]:
+                best = pair
+    lo, hi = GOOD_SEPARATION
+    gap = best["separation_deg"]
+    if gap < lo:
+        best["reason"] = (f"{gap:.0f} deg apart is too close - their shadows on the "
+                          f"board cross too shallowly to trust. Aim for {lo:.0f}-{hi:.0f}.")
+    elif gap > hi:
+        best["reason"] = (f"{gap:.0f} deg apart is wide - they will often be looking "
+                          "at opposite sides of the same dart.")
+    else:
+        best["reason"] = f"{gap:.0f} deg apart - good for fusing."
+    best["ready"] = lo <= gap <= hi
+    return best
 
 
 class ScoringEngine:
@@ -174,6 +248,19 @@ class ScoringEngine:
             self.detector = None
             return
         d = self.config.detector
+        tip_mode = d.tip_mode
+        if tip_mode == "auto":
+            # Which end of the blob is the point depends only on where the
+            # camera is, and the calibration already says where that is - so
+            # there is nothing here for the operator to get wrong.
+            try:
+                pose = measure_pose(self.calibration)
+                tip_mode = tip_mode_for_bearing(pose["bearing_deg"],
+                                                pose["elevation_deg"])
+            except Exception:
+                # A degenerate homography cannot say where the camera is; the
+                # rule that holds for almost every mounting is the safe default.
+                tip_mode = "centre"
         self.detector = DartDetector(
             self.calibration,
             diff_threshold=d.diff_threshold,
@@ -183,7 +270,7 @@ class ScoringEngine:
             motion_threshold=d.motion_threshold,
             learn_frames=d.learn_frames,
             min_elongation=d.min_elongation,
-            tip_mode=d.tip_mode,
+            tip_mode=tip_mode,
         )
         self._tips.clear()
 
@@ -226,7 +313,15 @@ class ScoringEngine:
     # Changing any of these means tearing the capture down and opening it
     # again; the rest can be pushed at a running camera.
     REOPEN_ON = frozenset({"source", "width", "height", "fourcc", "fps",
-                           "backend", "buffer_size"})
+                           "backend", "buffer_size", "stream",
+                           # How the frame is turned before anything sees it.
+                           "placement.rotate", "placement.flip_h",
+                           "placement.flip_v"})
+
+    # Changing any of these moves the board within the frame, so the homography
+    # stops describing where the board is - the same problem as zoom.
+    RECALIBRATE_ON = frozenset({"stream", "placement.rotate",
+                                "placement.flip_h", "placement.flip_v"})
 
     def apply_config(self, patch: dict, save: bool = True) -> dict:
         with self._lock:
@@ -236,14 +331,20 @@ class ScoringEngine:
                 self._reopen = True
             elif "controls" in camera:
                 self._push_controls()
+            recalibrate = sorted(
+                {k.split(".", 1)[1] for k in changed if k.startswith("camera.")}
+                & self.RECALIBRATE_ON)
             if any(k.startswith("detector.") for k in changed):
                 self._rebuild_detector()
             if any(k.startswith("game.") for k in changed):
                 self._new_game()
             if save and self.config_path:
                 self.config.save(self.config_path)
-        self.events.publish("config", changed=changed)
-        return self.config.to_dict()
+        self.events.publish("config", changed=changed, recalibrate=recalibrate)
+        result = self.config.to_dict()
+        result["changed"] = changed
+        result["recalibrate"] = recalibrate
+        return result
 
     # ------------------------------------------------------------------ #
     # camera controls
@@ -278,6 +379,62 @@ class ScoringEngine:
                   "recalibrate": geometry_moved}
         self.events.publish("camera", recalibrate=geometry_moved)
         return result
+
+    def views_info(self) -> dict:
+        """Every configured view, for the Cameras tab.
+
+        Each entry carries the placement the operator *expects* alongside the
+        one measured from the calibration. Those diverging is the signal that a
+        camera has been knocked, or that two identical devices came up in the
+        opposite order after a reboot - neither of which is otherwise visible
+        until the scores quietly go wrong.
+        """
+        with self._lock:
+            cfg = self.config
+            calib = self.calibration
+            primary = cfg.camera.name
+            source = self._source
+            open_now = source is not None
+
+        views = []
+        for view in cfg.views_all():
+            is_primary = view.name == primary
+            # Only the primary is actually opened today; the rest are
+            # configuration waiting for the multi-camera runtime.
+            measured = None
+            if is_primary and calib is not None:
+                try:
+                    measured = measure_pose(calib)
+                except Exception:                      # a degenerate homography
+                    measured = None
+            expected = {"bearing_deg": view.placement.bearing_deg,
+                        "elevation_deg": view.placement.elevation_deg,
+                        "distance_mm": view.placement.distance_mm}
+            views.append({
+                "name": view.name,
+                "role": "primary" if is_primary else "secondary",
+                "source": view.source,
+                "stream": view.stream,
+                "kinect": is_kinect_source(view.source),
+                "calibrated": bool(is_primary and calib is not None),
+                "calibration_path": view.calibration_path
+                                    or (cfg.calibration_path if is_primary
+                                        else f"calibration.{view.name}.json"),
+                "open": bool(is_primary and open_now),
+                "placement": {
+                    **expected,
+                    "rotate": view.placement.rotate,
+                    "flip_h": view.placement.flip_h,
+                    "flip_v": view.placement.flip_v,
+                },
+                "measured": measured,
+                "drift_deg": _bearing_drift(expected, measured),
+                "warnings": _view_warnings(view, measured),
+            })
+
+        return {"views": views, "primary": primary,
+                "kinect": kinect_status(),
+                "fusion": _fusion_outlook(views, cfg.fusion)}
 
     def camera_info(self) -> dict:
         """What the camera is actually doing, plus every control it exposes."""

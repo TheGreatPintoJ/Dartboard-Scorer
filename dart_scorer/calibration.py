@@ -198,6 +198,77 @@ class Calibration:
         )
 
 
+def measure_pose(calib, at=(0.0, 0.0), step_mm: float = 1.0) -> dict:
+    """Where the camera is, read straight out of the calibration.
+
+    A circle viewed off-axis images as an ellipse, squashed along the direction
+    pointing at the viewer. So take the board -> image map's Jacobian at the
+    bull and look at its two principal scales: the direction that shrinks most
+    is the direction the camera lies in, and how much it shrinks is the sine of
+    the camera's height above the board plane.
+
+    Both fall out of one SVD, and because elevation is a *ratio* of the two
+    scales, the focal length and the distance cancel - which is why this works
+    with no intrinsics and no extra setup step. Verified exact against known
+    synthetic camera poses; a millimetre of slop in the calibration clicks costs
+    about a third of a degree.
+
+    Distance is the one thing not recoverable: without a focal length, a close
+    wide-angle camera and a distant narrow one produce the same picture.
+
+    Returns bearing/elevation/roll in degrees, plus ``squash`` (the raw scale
+    ratio) for anyone who wants the unrounded number.
+    """
+    g = calib.board_matrix()
+
+    def image_of(p):
+        v = g @ [p[0], p[1], 1.0]
+        return v[:2] / v[2]
+
+    def jacobian(p):
+        h = step_mm
+        return np.column_stack([
+            (image_of((p[0] + h, p[1])) - image_of((p[0] - h, p[1]))) / (2 * h),
+            (image_of((p[0], p[1] + h)) - image_of((p[0], p[1] - h))) / (2 * h),
+        ])
+
+    j = jacobian(at)
+    _, sv, vt = np.linalg.svd(j)
+    axis = vt[1]                      # board direction with the smallest scale
+
+    # That axis is a line, not an arrow: it points at the camera or directly
+    # away from it. The near half of the board images larger, so compare.
+    probe = 120.0
+    if abs(np.linalg.det(jacobian(axis * probe))) < \
+            abs(np.linalg.det(jacobian(-axis * probe))):
+        axis = -axis
+
+    squash = float(sv[1] / sv[0]) if sv[0] > 1e-12 else 0.0
+    up = j @ np.array([0.0, -1.0])     # where "up on the board" points in frame
+
+    return {
+        "bearing_deg": round(float(geo.angle_of(axis[0], axis[1]) % 360.0), 1),
+        "elevation_deg": round(float(np.degrees(np.arcsin(np.clip(squash, 0.0, 1.0)))), 1),
+        "roll_deg": round(float(np.degrees(np.arctan2(up[0], -up[1]))), 1),
+        "squash": round(squash, 4),
+    }
+
+
+# Which end of the blob is the point, given where the camera sits. The barrel
+# and flight stand away from the board, so a camera low to the board's plane
+# sees them displaced towards itself - and the tip is the end on the far side.
+# This is the table the README used to ask the operator to pick by hand.
+def tip_mode_for_bearing(bearing_deg: float, elevation_deg: float = 90.0,
+                         near_plane_deg: float = 35.0) -> str:
+    """The ``tip_mode`` a camera at this bearing should use."""
+    if elevation_deg >= near_plane_deg:
+        # Looking down at the board rather than across it: the barrel always
+        # projects outwards from the bull, so the usual rule holds.
+        return "centre"
+    quadrant = round((bearing_deg % 360.0) / 90.0) % 4
+    return ("leftmost", "lowest", "rightmost", "highest")[quadrant]
+
+
 def normalise_line(line) -> np.ndarray:
     """Scale ``(a, b, c)`` so ``a^2 + b^2 == 1``.
 
