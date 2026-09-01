@@ -407,9 +407,26 @@ const LANDMARKS = [
 ];
 
 /* ---------------------------------------------------------------- video */
+// Which camera the video and the calibration clicks refer to. Empty means the
+// one that scores, which is what every URL meant before there was more than one.
+let videoView = "";
+// The pixel size of whatever the video element is currently showing. Clicks are
+// stored in that camera's own full-resolution coordinates, so getting this from
+// the primary while looking at a secondary would place every landmark wrongly.
+function activeFrameSize() {
+  if (videoView && viewsInfo) {
+    const v = viewsInfo.views.find((x) => x.name === videoView);
+    const size = v && v.runtime && v.runtime.frame_size;
+    if (size) return size;
+  }
+  return status?.frame_size || null;
+}
+const viewQuery = (sep) => videoView ? sep + "view=" + encodeURIComponent(videoView) : "";
+
 function liveVideo() {
   previewing = false;
-  $("video").src = url("/stream.mjpg") + (TOKEN ? "&" : "?") + "t=" + Date.now();
+  const base = url("/stream.mjpg");
+  $("video").src = base + (TOKEN ? "&" : "?") + "t=" + Date.now() + viewQuery("&");
 }
 
 async function api(path, options = {}) {
@@ -443,7 +460,7 @@ function drawOverlay() {
   const ctx = canvas.getContext("2d");
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   if (!placing) return;
-  const scale = canvas.width / (status?.frame_size?.[0] || img.naturalWidth || 1);
+  const scale = canvas.width / (activeFrameSize()?.[0] || img.naturalWidth || 1);
   points.forEach((p, i) => {
     const x = p[0] * scale, y = p[1] * scale;
     ctx.strokeStyle = i < 4 ? "#fbbf24" : "#60a5fa";
@@ -459,11 +476,20 @@ function drawOverlay() {
 
 function calibHint() {
   const hint = $("calib-hint");
+  // Which camera these buttons act on. Getting this from the scoring camera
+  // while looking at another one would say "calibrated" over a blank overlay.
+  const shown = videoView
+    ? (viewsInfo?.views || []).find((v) => v.name === videoView)
+    : null;
+  const who = shown ? `<b>${shown.name}</b>` : "this camera";
+  const done = shown ? shown.calibrated : status?.calibrated;
   if (!placing) {
-    hint.innerHTML = status?.calibrated
-      ? "Calibrated. The rings drawn on the video should sit on the real wires - "
-        + "if they drifted, the camera moved: calibrate again."
-      : "<b>Not calibrated.</b> Press Calibrate and click the four landmarks on the board.";
+    hint.innerHTML = done
+      ? `Calibrated ${shown ? "(" + shown.name + ")" : ""}. The rings drawn on the `
+        + "video should sit on the real wires - if they drifted, the camera "
+        + "moved: calibrate again."
+      : `<b>Not calibrated.</b> Press Calibrate and click the four landmarks on `
+        + `the board as ${who} sees it.`;
     return;
   }
   hint.innerHTML = points.length < LANDMARKS.length
@@ -490,7 +516,7 @@ function setPlacing(on) {
 $("video").addEventListener("click", (event) => {
   if (!placing || points.length >= LANDMARKS.length) return;
   const img = $("video"), rect = img.getBoundingClientRect();
-  const natural = status?.frame_size?.[0] || img.naturalWidth;
+  const natural = activeFrameSize()?.[0] || img.naturalWidth;
   const scale = natural / rect.width;
   points.push([(event.clientX - rect.left) * scale, (event.clientY - rect.top) * scale]);
   if (previewing) liveVideo();
@@ -511,7 +537,8 @@ $("btn-undo-point").onclick = () => {
 
 $("btn-auto").onclick = async () => {
   try {
-    const data = await api("/api/calibration/auto", { method: "POST", body: "{}" });
+    const data = await api("/api/calibration/auto" + viewQuery("?"),
+                           { method: "POST", body: "{}" });
     points = data.points;
     drawOverlay(); calibHint();
     $("btn-save-calib").disabled = false;
@@ -522,7 +549,7 @@ $("btn-auto").onclick = async () => {
 
 $("btn-preview").onclick = async () => {
   try {
-    const blob = await api("/api/calibration/preview",
+    const blob = await api("/api/calibration/preview" + viewQuery("?"),
       { method: "POST", body: JSON.stringify({ points }) });
     $("video").src = URL.createObjectURL(blob);
     previewing = true;
@@ -532,23 +559,26 @@ $("btn-preview").onclick = async () => {
 
 $("btn-save-calib").onclick = async () => {
   try {
-    await api("/api/calibration",
+    await api("/api/calibration" + viewQuery("?"),
       { method: "POST", body: JSON.stringify({ points, save: true }) });
     setPlacing(false);
     liveVideo();
+    if (videoView) loadViews();
     toast("Calibration saved");
   } catch (err) { toast(err.message, true); }
 };
 
 $("btn-clear-calib").onclick = async () => {
   if (!confirm("Delete the saved calibration?")) return;
-  await api("/api/calibration", { method: "DELETE" });
+  await api("/api/calibration" + viewQuery("?"), { method: "DELETE" });
+  if (videoView) { loadViews(); liveVideo(); }
   toast("Calibration cleared");
 };
 
 $("btn-rectified").onclick = () => {
   if (previewing) { liveVideo(); return; }
-  $("video").src = url("/rectified.jpg") + (TOKEN ? "&" : "?") + "t=" + Date.now();
+  $("video").src = url("/rectified.jpg") + (TOKEN ? "&" : "?") + "t=" + Date.now()
+                   + viewQuery("&");
   previewing = true;
   toast("Flat view - press again for live video");
 };
@@ -748,8 +778,12 @@ function renderViews(info) {
     chip.onclick = () => {
       selectedView = v.name;
       placementTouched = false;
+      // Point the video - and therefore the calibration clicks - at this one.
+      videoView = v.role === "primary" ? "" : v.name;
+      setPlacing(false);
       renderViews(viewsInfo);
       liveVideo();
+      calibHint();
     };
     chips.appendChild(chip);
   }
@@ -1001,9 +1035,21 @@ function connect() {
     if (data.status) render(data.status);
     else if (data.state && !data.type) render(data);       // first payload
     if (data.type === "dart") {
+      // How much the second camera moved the point is the parallax error it
+      // just removed - the number the whole two-camera exercise is about.
+      const f = data.fusion;
+      let how = "";
+      if (f && f.mode === "fused") {
+        const moved = f.parallax_mm?.[f.views?.[0]];
+        how = ` - fused from ${f.views.join(" + ")}`
+            + (moved ? `, corrected ${moved} mm` : "");
+      } else if (f && f.reasons?.length) {
+        how = ` - one camera only (${f.reasons[0]})`;
+      }
       logLine(`<b>${data.label}</b> for ${data.points}` +
         (data.near_wire ? " (near a wire)" : "") +
-        (data.confidence < 0.6 ? ` - low confidence ${data.confidence}` : ""));
+        (data.confidence < 0.6 ? ` - low confidence ${data.confidence}` : "") +
+        how);
     } else if (data.type === "cleared") {
       logLine(`darts pulled - visit scored ${data.scored}`);
     } else if (data.type === "state") {

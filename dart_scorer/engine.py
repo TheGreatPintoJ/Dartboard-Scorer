@@ -16,6 +16,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from . import fusion
 from . import geometry as geo
 from . import render
 from .calibration import Calibration, measure_pose, tip_mode_for_bearing
@@ -25,6 +26,7 @@ from .detector import DartDetector
 from .kinect import is_kinect_source, kinect_status
 from .session import Session
 from .synthetic import DemoSource
+from .views import ViewManager
 
 
 class EventHub:
@@ -71,7 +73,21 @@ def open_source(camera_cfg):
 # How far apart two views' bearings should be. Below the minimum their shadows
 # on the board cross too shallowly to trust (see fusion.MIN_SIN_THETA); much
 # beyond the maximum and they start to disagree about which dart is which.
-GOOD_SEPARATION = (55.0, 125.0)
+LOG_COLUMNS = ["timestamp", "player", "label", "points", "x_mm", "y_mm",
+               "radius_mm", "angle_deg", "confidence",
+               "fusion_mode", "fusion_views", "residual_mm",
+               "sin_theta", "parallax_mm"]
+
+# How far apart two views' bearings should be. Below the usable figure their
+# shadows on the board cross too shallowly to trust (see fusion.MIN_SIN_THETA).
+#
+# There is deliberately no upper bound. Measured over simulated throws, accuracy
+# improves all the way to diametrically opposite: 90 deg apart fuses 78% of
+# throws to a 1.8 mm median, 165 deg fuses 85% to 1.4 mm. Two cameras facing
+# each other were expected to be a problem and are not - their shadows are
+# mirror images about the dart, not parallel.
+GOOD_SEPARATION = 90.0
+USABLE_SEPARATION = 75.0
 DRIFT_WARN_DEG = 15.0
 
 
@@ -122,17 +138,18 @@ def _fusion_outlook(views: list[dict], cfg) -> dict:
                     "separation_deg": round(gap, 1)}
             if best is None or gap > best["separation_deg"]:
                 best = pair
-    lo, hi = GOOD_SEPARATION
     gap = best["separation_deg"]
-    if gap < lo:
-        best["reason"] = (f"{gap:.0f} deg apart is too close - their shadows on the "
-                          f"board cross too shallowly to trust. Aim for {lo:.0f}-{hi:.0f}.")
-    elif gap > hi:
-        best["reason"] = (f"{gap:.0f} deg apart is wide - they will often be looking "
-                          "at opposite sides of the same dart.")
+    if gap < USABLE_SEPARATION:
+        best["reason"] = (
+            f"{gap:.0f} deg apart is too close - their shadows on the board cross "
+            f"too shallowly to trust. More is better all the way round: aim for "
+            f"{GOOD_SEPARATION:.0f} deg or more, opposite sides of the board is fine.")
+    elif gap < GOOD_SEPARATION:
+        best["reason"] = (f"{gap:.0f} deg apart will fuse, but further apart is "
+                          "better - accuracy keeps improving up to opposite.")
     else:
         best["reason"] = f"{gap:.0f} deg apart - good for fusing."
-    best["ready"] = lo <= gap <= hi
+    best["ready"] = gap >= USABLE_SEPARATION
     return best
 
 
@@ -170,6 +187,9 @@ class ScoringEngine:
 
         self._frame_size: tuple[int, int] | None = None
         self._open_error: str | None = None
+        # Extra cameras. They stream and calibrate but never score, so a
+        # half-set-up second camera cannot disturb a game in progress.
+        self.views = ViewManager(config, open_source)
         self._load_calibration()
 
     # ------------------------------------------------------------------ #
@@ -181,9 +201,11 @@ class ScoringEngine:
         self._running = True
         self._thread = threading.Thread(target=self._loop, name="scoring", daemon=True)
         self._thread.start()
+        self.views.sync()
 
     def stop(self) -> None:
         self._running = False
+        self.views.stop_all()
         if self._thread:
             self._thread.join(timeout=3.0)
         with self._lock:
@@ -261,8 +283,13 @@ class ScoringEngine:
                 # A degenerate homography cannot say where the camera is; the
                 # rule that holds for almost every mounting is the safe default.
                 tip_mode = "centre"
+        # Room for fusion to correct a borderline point. Without a second
+        # camera there is nothing to correct it with, so no slack is given.
+        margin = (self.config.fusion.max_correction_mm
+                  if self.config.fusion.enabled and self.config.views else 0.0)
         self.detector = DartDetector(
             self.calibration,
+            reject_margin_mm=margin,
             diff_threshold=d.diff_threshold,
             min_area=d.min_area,
             max_area=d.max_area,
@@ -340,6 +367,8 @@ class ScoringEngine:
                 self._new_game()
             if save and self.config_path:
                 self.config.save(self.config_path)
+        if any(k.startswith("views.") for k in changed):
+            self.views.sync()
         self.events.publish("config", changed=changed, recalibrate=recalibrate)
         result = self.config.to_dict()
         result["changed"] = changed
@@ -399,14 +428,15 @@ class ScoringEngine:
         views = []
         for view in cfg.views_all():
             is_primary = view.name == primary
-            # Only the primary is actually opened today; the rest are
-            # configuration waiting for the multi-camera runtime.
+            runtime = None if is_primary else self.views.get(view.name)
             measured = None
             if is_primary and calib is not None:
                 try:
                     measured = measure_pose(calib)
                 except Exception:                      # a degenerate homography
                     measured = None
+            elif runtime is not None:
+                measured = runtime.info()["measured"]
             expected = {"bearing_deg": view.placement.bearing_deg,
                         "elevation_deg": view.placement.elevation_deg,
                         "distance_mm": view.placement.distance_mm}
@@ -416,11 +446,13 @@ class ScoringEngine:
                 "source": view.source,
                 "stream": view.stream,
                 "kinect": is_kinect_source(view.source),
-                "calibrated": bool(is_primary and calib is not None),
-                "calibration_path": view.calibration_path
-                                    or (cfg.calibration_path if is_primary
-                                        else f"calibration.{view.name}.json"),
-                "open": bool(is_primary and open_now),
+                "calibrated": bool(calib is not None) if is_primary else
+                              bool(runtime and runtime.calibration is not None),
+                "calibration_path": cfg.calibration_path if is_primary
+                                    else self.views.calibration_path_for(view),
+                "open": bool(open_now) if is_primary else
+                        bool(runtime and runtime.info()["open"]),
+                "runtime": None if is_primary else (runtime.info() if runtime else None),
                 "placement": {
                     **expected,
                     "rotate": view.placement.rotate,
@@ -571,6 +603,79 @@ class ScoringEngine:
         return view
 
     # ------------------------------------------------------------------ #
+    # fusion
+    # ------------------------------------------------------------------ #
+    def _fuse(self, dart, when: float):
+        """Ask the other cameras where they think this dart landed.
+
+        The scoring camera has already decided a dart happened; this only ever
+        moves where it landed. The other views are asked, not listened to - so
+        one of them mis-seeing something can shift a point by at most a few
+        millimetres, and never invent, delete or misattribute a dart.
+
+        Each view measures the *visible* end of the dart, which stands proud of
+        the board, so perspective drags it sideways. But the point itself is in
+        the board, and therefore on the shadow the shaft casts there from every
+        viewpoint - so where two shadows cross is the point. See fusion.py.
+        """
+        cfg = self.config.fusion
+        if not cfg.enabled or self.calibration is None:
+            return dart, None
+        primary = fusion.view_axis_from_dart(
+            self.config.camera.name, self.calibration, dart)
+        if primary is None:
+            return dart, None
+
+        axes = [primary]
+        for view in self.config.views:
+            runtime = self.views.get(view.name)
+            if runtime is None or runtime.calibration is None:
+                continue
+            # What it settled on itself, else measured at the moment the
+            # scoring camera saw the dart.
+            seen = runtime.observation_near(when, cfg.match_window) \
+                or runtime.measure_at(when)
+            if seen is None:
+                continue
+            axis = fusion.view_axis_from_dart(view.name, runtime.calibration, seen)
+            if axis is not None:
+                axes.append(axis)
+        if len(axes) < 2:
+            return dart, None
+
+        result = fusion.fuse(
+            axes, primary=primary.name,
+            min_sin_theta=cfg.min_sin_theta,
+            max_correction_mm=cfg.max_correction_mm,
+            min_segment_mm=cfg.min_segment_mm,
+            endpoint_tolerance_mm=cfg.endpoint_tolerance_mm,
+            max_pair_mm=cfg.max_pair_mm)
+
+        info = {"mode": result.mode, "views": result.views,
+                "residual_mm": round(result.residual_mm, 2),
+                "sin_theta": round(result.sin_theta, 3),
+                "reasons": result.reasons,
+                "parallax_mm": {k: round(v, 1)
+                                for k, v in result.parallax_mm.items()}}
+        dart.fusion = info
+        if result.mode != "fused" or result.board_mm is None:
+            dart.confidence = round(dart.confidence * result.confidence_factor, 2)
+            return dart, info
+
+        # Nothing outside the board can be a dart stuck in it. The single-view
+        # check ran with slack so fusion had room to pull a borderline reading
+        # back; this is the real one, applied to the answer we are keeping.
+        if geo.radius_of(*result.board_mm) > geo.R_BOARD:
+            info["mode"] = "rejected"
+            dart.confidence = round(dart.confidence * 0.5, 2)
+            return dart, info
+
+        dart.board_mm = result.board_mm
+        dart.score = geo.score_at(*result.board_mm)
+        dart.confidence = round(min(1.0, dart.confidence * result.confidence_factor), 2)
+        return dart, info
+
+    # ------------------------------------------------------------------ #
     # status
     # ------------------------------------------------------------------ #
     def status(self) -> dict:
@@ -616,18 +721,34 @@ class ScoringEngine:
             return
         if self._log_writer is None:
             path = Path(self.config.log_path)
+            # A CSV whose header predates the fusion columns would silently
+            # gain five unlabelled fields from here on, misaligning every row
+            # that follows. Roll it over instead and start a clean one.
+            if path.exists():
+                try:
+                    first = path.open(encoding="utf-8").readline().strip()
+                    if first and first.split(",") != LOG_COLUMNS:
+                        path.rename(path.with_suffix(path.suffix + ".v1"))
+                except OSError:
+                    pass
             new = not path.exists()
             self._log_file = open(path, "a", newline="", encoding="utf-8")
             self._log_writer = csv.writer(self._log_file)
             if new:
-                self._log_writer.writerow(
-                    ["timestamp", "player", "label", "points", "x_mm", "y_mm",
-                     "radius_mm", "angle_deg", "confidence"])
+                self._log_writer.writerow(LOG_COLUMNS)
+        f = dart.fusion or {}
         self._log_writer.writerow([
             f"{time.time():.3f}", self.session.player.name, dart.label, dart.points,
             f"{dart.board_mm[0]:.1f}", f"{dart.board_mm[1]:.1f}",
             f"{geo.radius_of(*dart.board_mm):.1f}", f"{dart.score.angle_deg:.1f}",
-            dart.confidence])
+            dart.confidence,
+            f.get("mode", "single"),
+            "+".join(f.get("views", [])),
+            f.get("residual_mm", ""),
+            f.get("sin_theta", ""),
+            # How far this camera's own answer sat from the fused one: the
+            # parallax error, in millimetres, actually measured.
+            f.get("parallax_mm", {}).get(self.config.camera.name, "")])
         self._log_file.flush()
 
     def _publish_frame(self, frame) -> None:
@@ -743,6 +864,12 @@ class ScoringEngine:
                 with self._lock:
                     previous, self._state = self._state, result.state.value
                 for dart in result.darts:
+                    seen_at = time.monotonic()
+                    dart, fused = self._fuse(dart, seen_at)
+                    for view in self.config.views:
+                        runtime = self.views.get(view.name)
+                        if runtime is not None:
+                            runtime.note_scored(seen_at)
                     with self._lock:
                         self.session.add_dart(dart)
                         self._tips.append(dart)
@@ -752,6 +879,7 @@ class ScoringEngine:
                         "dart", label=dart.label, points=dart.points,
                         confidence=dart.confidence, near_wire=dart.score.near_wire,
                         board_mm=[round(v, 1) for v in dart.board_mm],
+                        fusion=dart.fusion,
                         message=message, status=self.status())
                 if result.cleared:
                     with self._lock:

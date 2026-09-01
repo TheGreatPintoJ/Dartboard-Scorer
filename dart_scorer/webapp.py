@@ -31,6 +31,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from . import render
+
 WEB_ROOT = Path(__file__).parent / "web"
 BOUNDARY = "dartframe"
 MAX_BODY = 1 << 20
@@ -118,13 +120,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._file(WEB_ROOT / "index.html", cookie)
             if path.startswith("/static/"):
                 return self._file(WEB_ROOT / path[len("/static/"):], cookie)
+            # ?view= names an extra camera; absent means the one that scores,
+            # which is what keeps every existing URL behaving as it always did.
+            view = self._view(query)
             if path == "/stream.mjpg":
-                return self._stream()
+                return self._stream(view)
             if path == "/snapshot.jpg":
                 annotated = (query.get("annotated") or ["1"])[0] != "0"
-                return self._image(self.engine.snapshot(annotated))
+                return self._image(view.snapshot(annotated) if view
+                                   else self.engine.snapshot(annotated))
             if path == "/rectified.jpg":
-                return self._image(self.engine.rectified())
+                return self._image(view.rectified() if view
+                                   else self.engine.rectified())
             if path == "/api/status":
                 return self._json(self.engine.status())
             if path == "/api/events":
@@ -132,6 +139,11 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/config":
                 return self._json(self.engine.config.to_dict())
             if path == "/api/calibration":
+                if view is not None:
+                    info = view.info()
+                    return self._json({"calibrated": info["calibrated"],
+                                       "points": info["calibration_points"],
+                                       "frame_size": info["frame_size"]})
                 status = self.engine.status()
                 return self._json({"calibrated": status["calibrated"],
                                    "points": status["calibration_points"],
@@ -147,6 +159,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(self.engine.views_info())
         except BrokenPipeError:
             return
+        except ValueError as exc:            # an unknown ?view=, mostly
+            return self._error(HTTPStatus.NOT_FOUND, str(exc))
         except Exception as exc:                             # keep the service up
             return self._error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
         return self._error(HTTPStatus.NOT_FOUND, f"no route for {parsed.path}")
@@ -170,23 +184,28 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/config":
                 return self._json(self.engine.apply_config(body))
 
+            target = self._view(query)
             if path == "/api/calibration":
                 points = body.get("points") or []
                 if len(points) < 4:
                     return self._error(HTTPStatus.BAD_REQUEST,
                                        "four landmarks are needed")
-                result = self.engine.set_calibration(points, save=body.get("save", True))
+                save = body.get("save", True)
+                result = (target.set_calibration(points, save=save) if target
+                          else self.engine.set_calibration(points, save=save))
                 return self._json(result)
 
             if path == "/api/calibration/preview":
-                jpeg = self.engine.preview(body.get("points") or [])
+                jpeg = (self._view_preview(target, body.get("points") or [])
+                        if target else self.engine.preview(body.get("points") or []))
                 if jpeg is None:
                     return self._error(HTTPStatus.BAD_REQUEST,
                                        "need a frame and four usable landmarks")
                 return self._image(jpeg)
 
             if path == "/api/calibration/auto":
-                points = self.engine.auto_points()
+                points = (self._view_auto(target) if target
+                          else self.engine.auto_points())
                 if points is None:
                     return self._error(HTTPStatus.NOT_FOUND,
                                        "could not find the board - place the "
@@ -234,9 +253,54 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorised(parse_qs(parsed.query)):
             return self._error(HTTPStatus.UNAUTHORIZED, "token required")
         if posixpath.normpath(parsed.path) == "/api/calibration":
-            self.engine.clear_calibration()
+            view = self._view(parse_qs(parsed.query))
+            if view is not None:
+                view.clear_calibration()
+            else:
+                self.engine.clear_calibration()
             return self._json({"calibrated": False})
         return self._error(HTTPStatus.NOT_FOUND, f"no route for {parsed.path}")
+
+    # ------------------------------------------------------------------ #
+    # views
+    # ------------------------------------------------------------------ #
+    def _view(self, query):
+        """The extra camera named by ?view=, or None for the one that scores.
+
+        Naming the primary explicitly is the same as not naming anything, so
+        the browser can address every camera the same way without having to
+        know which one happens to be doing the scoring.
+        """
+        name = (query.get("view") or [""])[0].strip()
+        if not name or name == self.engine.config.camera.name:
+            return None
+        view = self.engine.views.get(name)
+        if view is None:
+            raise ValueError(f"no camera named {name!r}")
+        return view
+
+    @staticmethod
+    def _view_preview(view, points):
+        """The board outline drawn over a secondary's picture, for candidate
+        landmarks - the same check the primary offers before saving."""
+        from .calibration import Calibration
+        frame = view.latest()
+        if frame is None or len(points) < 4:
+            return None
+        try:
+            calib = Calibration.from_points(points, frame.shape[1::-1])
+        except ValueError:
+            return None
+        return view._encode(render.draw_board_overlay(frame.copy(), calib))
+
+    @staticmethod
+    def _view_auto(view):
+        from .calibration import ellipse_reference_guess, fit_board_ellipse
+        frame = view.latest()
+        if frame is None:
+            return None
+        ellipse = fit_board_ellipse(frame)
+        return None if ellipse is None else ellipse_reference_guess(ellipse)
 
     # ------------------------------------------------------------------ #
     # responses
@@ -258,7 +322,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(HTTPStatus.SERVICE_UNAVAILABLE, "no frame yet")
         self._send(HTTPStatus.OK, jpeg, "image/jpeg")
 
-    def _stream(self):
+    def _stream(self, view=None):
         self.close_connection = True
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type",
@@ -267,7 +331,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         try:
-            for jpeg in self.engine.stream():
+            frames = view.stream() if view is not None else self.engine.stream()
+            for jpeg in frames:
                 self.wfile.write(f"--{BOUNDARY}\r\n".encode())
                 self.wfile.write(b"Content-Type: image/jpeg\r\n")
                 self.wfile.write(f"Content-Length: {len(jpeg)}\r\n\r\n".encode())
@@ -315,40 +380,100 @@ def probe_cameras(limit: int = 6) -> list[int]:
     return found
 
 
-def _v4l2_name(index: int) -> str:
-    """What Linux calls this camera, so the picker is not a list of numbers."""
+def _read(path) -> str:
     try:
-        return Path(f"/sys/class/video4linux/video{index}/name").read_text().strip()
+        return Path(path).read_text().strip()
     except OSError:
         return ""
+
+
+def _stable_path(index: int) -> str:
+    """The /dev/v4l/by-id/... name for a camera, if it has one.
+
+    Worth preferring over the index: indices are handed out in probe order, so
+    unplugging anything renumbers them, while the by-id name follows the camera.
+    """
+    byid = Path("/dev/v4l/by-id")
+    if not byid.is_dir():
+        return ""
+    for link in sorted(byid.iterdir()):
+        try:
+            if link.resolve() == Path(f"/dev/video{index}").resolve():
+                return str(link)
+        except OSError:
+            continue
+    return ""
+
+
+def _linux_cameras() -> list[dict] | None:
+    """Cameras from sysfs, without opening any of them.
+
+    Opening each index in turn - which is what probe_cameras does - cannot see
+    a camera that something else already has open, so the running scorer's own
+    camera would be missing from its own picker. Reading sysfs has no such
+    problem, and it also tells us the make and model.
+    """
+    root = Path("/sys/class/video4linux")
+    if not root.is_dir():
+        return None
+    found = []
+    for node in sorted(root.iterdir(), key=lambda p: int(p.name[5:] or 0)):
+        index = int(node.name[5:] or 0)
+        name = _read(node / "name")
+        # A capture-capable node reports index 0; the others are metadata or
+        # output nodes of the same device, which nothing can stream from.
+        if _read(node / "index") not in ("", "0"):
+            continue
+        # The Pi's own codec and ISP blocks are video4linux devices too.
+        if any(k in name.lower() for k in ("bcm2835", "codec", "isp")):
+            continue
+        vendor = _read(node / "device/../idVendor")
+        product = _read(node / "device/../idProduct")
+        stable = _stable_path(index)
+        found.append({
+            "source": stable or str(index),
+            "index": index,
+            "label": f"{name} (/dev/video{index})" if name else f"/dev/video{index}",
+            "kind": "camera",
+            "usb": f"{vendor}:{product}" if vendor else "",
+            "stable": bool(stable),
+        })
+    return found
 
 
 def probe_devices(limit: int = 6) -> dict:
     """Everything the operator could pick as a source.
 
-    Kinects are listed separately because they are not video4linux devices at
-    all - libfreenect talks to them over raw USB, so they never turn up as an
-    index no matter how many you scan.
+    A Kinect is not a video4linux device - libfreenect drives it over raw USB -
+    so it never appears as an index no matter how many are scanned. It is found
+    on the USB bus instead, and listed whether or not the driver to use it is
+    installed, with the reason attached.
     """
-    from .kinect import kinect_status
+    from .kinect import USB_CAMERA, USB_VENDOR, kinect_status, usb_devices
 
-    cameras = []
-    for index in probe_cameras(limit):
-        name = _v4l2_name(index)
-        cameras.append({
-            "source": str(index),
-            "label": f"{index}: {name}" if name else str(index),
-            "kind": "kinect" if "kinect" in name.lower() else "camera",
-        })
+    cameras = _linux_cameras()
+    if cameras is None:                       # not Linux: fall back to probing
+        cameras = [{"source": str(i), "index": i, "label": f"camera {i}",
+                    "kind": "camera", "usb": "", "stable": False}
+                   for i in probe_cameras(limit)]
 
     kinect = kinect_status()
-    for device in range(kinect.get("devices", 0)):
-        cameras.append({"source": f"kinect:{device}",
-                        "label": f"Kinect v1 #{device}", "kind": "kinect"})
+    plugged = usb_devices()
+    if plugged and not kinect["driver"]:
+        kinect["reason"] = ("a Kinect is plugged in, but it cannot be used yet: "
+                            + kinect["reason"])
+
+    for device in range(len(plugged)):
+        cameras.append({
+            "source": f"kinect:{device}", "index": None,
+            "label": f"Kinect v1 #{device}"
+                     + ("" if kinect["available"] else " - needs libfreenect"),
+            "kind": "kinect", "usb": f"{USB_VENDOR}:{USB_CAMERA}",
+            "stable": True, "usable": kinect["available"],
+        })
 
     # Kept for anyone still reading the old shape.
-    return {"cameras": [int(c["source"]) for c in cameras
-                        if c["source"].isdigit()],
+    return {"cameras": [c["index"] for c in cameras if c.get("index") is not None],
             "devices": cameras, "kinect": kinect}
 
 

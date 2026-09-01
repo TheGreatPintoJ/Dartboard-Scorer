@@ -167,6 +167,38 @@ class DartDetector:
         if frame is not None:
             self.state = State.READY
 
+    def measure_frame(self, frame, reference=None) -> Dart | None:
+        """Measure the newest blob in one frame, without advancing any state.
+
+        The second camera is asked about a dart *after* the fact - when the
+        scoring camera has already decided one landed - so it needs to measure
+        a frame on demand rather than only in the course of its own settling.
+        Deliberately free of side effects: nothing here may move the reference
+        the running detector is differencing against.
+        """
+        return self.measure_gray(self._prepare(frame), reference)
+
+    def measure_gray(self, gray, reference=None) -> Dart | None:
+        """As :meth:`measure_frame`, for an already-prepared frame.
+
+        Keeping frames as prepared greyscale rather than colour is what makes a
+        few seconds of history affordable: a 640x480 colour frame is 900 kB and
+        the grey one 300 kB, and on a Pi the buffer is the difference between
+        tens of megabytes and hundreds.
+        """
+        base = self._last_stable if reference is None else reference
+        if gray is None or base is None or base.shape != gray.shape:
+            return None
+        mask, area = self._mask_against(gray, base)
+        if area < self.min_area:
+            return None
+        return self._measure(mask)
+
+    @property
+    def reference(self):
+        """The frame this detector is currently differencing against."""
+        return self._last_stable
+
     def update(self, frame) -> Result:
         gray = self._prepare(frame)
         # Movement is measured as the number of pixels that changed since the

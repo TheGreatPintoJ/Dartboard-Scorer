@@ -259,11 +259,18 @@ def measure_pose(calib, at=(0.0, 0.0), step_mm: float = 1.0) -> dict:
 # sees them displaced towards itself - and the tip is the end on the far side.
 # This is the table the README used to ask the operator to pick by hand.
 def tip_mode_for_bearing(bearing_deg: float, elevation_deg: float = 90.0,
-                         near_plane_deg: float = 35.0) -> str:
-    """The ``tip_mode`` a camera at this bearing should use."""
+                         near_plane_deg: float = 15.0) -> str:
+    """The ``tip_mode`` a camera at this bearing should use.
+
+    The threshold is deliberately low. "The end nearer the bull is the point"
+    holds for any camera that can see the board face at all, and only breaks
+    for one mounted so nearly *in* the board's plane that a dart can appear to
+    point back towards the centre. Reaching for a geometric rule any sooner
+    replaces a rule that works with one that guesses a quadrant.
+    """
     if elevation_deg >= near_plane_deg:
-        # Looking down at the board rather than across it: the barrel always
-        # projects outwards from the bull, so the usual rule holds.
+        # Looking at the face rather than across it: the barrel always projects
+        # outwards from the bull, so the usual rule holds.
         return "centre"
     quadrant = round((bearing_deg % 360.0) / 90.0) % 4
     return ("leftmost", "lowest", "rightmost", "highest")[quadrant]

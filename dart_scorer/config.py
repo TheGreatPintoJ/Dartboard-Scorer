@@ -120,6 +120,12 @@ class FusionConfig:
     endpoint_tolerance_mm: float = 60.0
     # How far apart two views' settle times may be and still be the same dart.
     match_window: float = 0.8
+    # How often a watching camera runs detection. It only has to notice a
+    # dart that then sits still for the best part of a second, so running
+    # this at the full frame rate buys nothing and costs a great deal -
+    # on a Pi 3 it was the difference between 10 fps and 4 on the camera
+    # that actually scores.
+    watch_fps: int = 8
 
 
 @dataclass

@@ -348,6 +348,27 @@ def _confidence(residual_mm: float, sin_theta: float) -> float:
     return round(good_residual * good_angle, 3)
 
 
+def view_axis_from_dart(name, calib, dart, *, weight: float = 1.0) -> ViewAxis | None:
+    """One view's contribution, taken from a dart it already measured.
+
+    The detector throws away the axis direction and keeps only the end it
+    picked; these are the fields it now keeps alongside, which is all that is
+    needed to work out where that view's shadow falls on the board.
+    """
+    if getattr(dart, "axis_image", None) is None or \
+            getattr(dart, "ends_image", None) is None:
+        return None
+    return ViewAxis(
+        name=name,
+        line=calib.image_line_to_board(dart.axis_image),
+        ends_mm=(calib.to_board_mm(dart.ends_image[0]),
+                 calib.to_board_mm(dart.ends_image[1])),
+        single_mm=tuple(dart.board_mm),
+        sigma_deg=max(getattr(dart, "axis_sigma_deg", 0.0) or 0.0, 1e-3),
+        weight=weight,
+    )
+
+
 def view_axis(name, calib, fit: AxisFit, single_mm, *, weight: float = 1.0) -> ViewAxis:
     """Turn one view's image-space axis fit into its shadow on the board."""
     return ViewAxis(

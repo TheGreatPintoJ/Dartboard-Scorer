@@ -158,8 +158,20 @@ Two things it cannot do. Shadows that cross at a shallow angle - a dart lying
 almost flat, or two cameras too close together - give an answer wildly sensitive
 to noise, so those fall back to a single view. And if fusing moves the point more
 than 30 mm, the single-view answer is kept instead, which bounds the worst case
-to no worse than one camera. `tests/test_fusion.py` measures the whole thing on
-synthetic 3D darts.
+to no worse than one camera.
+
+The second camera is only ever *asked*. The scoring camera alone decides whether
+a dart happened, when, and how many, so a shadow or a passing hand in the second
+view cannot invent a throw, and that camera failing cannot stop a game - it just
+goes back to scoring from one. The two are matched by time rather than by frame:
+each dart stays put for the best part of a second, so the second camera is asked
+for the stillest frame it has near the moment the first one saw it.
+
+Every throw records which cameras contributed, how far apart their shadows
+crossed, and how many millimetres the correction moved the point - that last
+number is the parallax error, measured rather than estimated, in `throws.csv`.
+`tests/test_fusion.py` measures the geometry on synthetic 3D darts;
+`tests/test_fusion_wiring.py` drives it through the running engine.
 
 A blob whose point falls outside the physical board is discarded rather than
 scored: an arm reaching in, someone walking past or a shifting shadow cannot be
@@ -195,8 +207,26 @@ or is not the one you thought it was.
 infrared, and the depth map the infrared one produces. Infrared is lit by the
 Kinect's own emitter, so it does not care whether the room lights are on. Colour
 and infrared are separate sensors about 25 mm apart, so switching between them
-needs a fresh calibration. This needs `libfreenect`; without it the selector says
-so and everything else carries on as normal.
+needs a fresh calibration.
+
+A Kinect is found on the USB bus whether or not its driver is installed, so a
+missing driver and missing hardware never look the same. To actually use one:
+
+```bash
+sudo apt install libfreenect-dev freenect     # or ./deploy/install.sh --with-kinect
+```
+
+The library is reached through `ctypes`, not libfreenect's own Cython wrapper -
+that has to be compiled against the exact Python and NumPy in use and is not
+packaged for either. So there is still nothing to `pip install`, and nothing to
+break on a NumPy upgrade.
+
+Two traps worth knowing. `gspca_kinect` is a kernel driver that claims the
+Kinect's camera and presents a `/dev/video` node which enumerates but cannot
+stream - it breaks the Kinect *and* renumbers every other camera; the installer
+blacklists it. And because a Kinect is not a video4linux device, the systemd
+unit needs `DeviceAllow=char-usb_device rw` or the device cgroup denies it
+whatever the file permissions say.
 
 **Camera controls** sits under the video: focus, zoom, exposure, auto-exposure,
 autofocus, gain, brightness, contrast, saturation, sharpness, auto white
@@ -350,6 +380,7 @@ python tests/test_fusion.py       # two-view geometry and its fallbacks
 python tests/test_calibration.py  # board lines, frame-size mismatches
 python tests/test_engine.py       # the scoring thread survives a bad camera
 python tests/test_views.py        # camera placement, measured pose, /api/views
+python tests/test_fusion_wiring.py # two cameras through the running engine
 ```
 
 `test_webapp.py` starts the real server on a spare port, throws darts at the
@@ -357,11 +388,13 @@ demo board and checks the HTTP surface reports them.
 
 ## Known limits
 
-- **One camera cannot see depth.** A dart at a steep angle is measured where its
-  point *appears*, so an extreme angle can read a millimetre or two off. The fix
-  is a second camera at ~90 degrees; the geometry for it is written and tested in
-  `fusion.py` (see "Finding the point, with two cameras"), but opening two cameras at once and
-  matching a dart between them is not - so today this remains a real limit.
+- **One camera cannot see depth**, so with a single camera a dart at a steep
+  angle is still measured where its point *appears*. Add a second camera 60-120
+  degrees away and the two views are intersected instead - see "Finding the
+  point, with two cameras". What remains: a dart pointing almost straight at a
+  camera is foreshortened into a stub that camera cannot measure an axis from,
+  and two shadows that cross at a shallow angle are too ill-conditioned to
+  trust. Both fall back to the single-camera answer and say so.
 - **A dart hidden behind another** will not be seen as a separate blob. It is
   logged as a low-confidence detection rather than silently scored wrong.
 - **Wire calls** are flagged, not resolved.

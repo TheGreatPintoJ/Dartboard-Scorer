@@ -15,7 +15,7 @@ Type=exec
 User=dartscorer
 Group=dartscorer
 # Needed to open /dev/video* on most distributions.
-SupplementaryGroups=video
+SupplementaryGroups=video kinect
 
 WorkingDirectory=/opt/dart-scorer
 Environment=PYTHONUNBUFFERED=1
@@ -61,6 +61,12 @@ SystemCallErrorNumber=EPERM
 PrivateDevices=no
 DevicePolicy=closed
 DeviceAllow=char-video4linux rw
+# A Kinect is not a V4L2 device: libfreenect talks to it through raw libusb,
+# i.e. /dev/bus/usb/*/*, which is character major 189 - "usb_device" in
+# /proc/devices. Without this the cgroup denies it whatever the file
+# permissions say. If a kernel does not register that name systemd logs a
+# warning and silently drops the line; "char-189:* rw" is the fallback.
+DeviceAllow=char-usb_device rw
 
 [Install]
 WantedBy=multi-user.target

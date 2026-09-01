@@ -16,6 +16,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dart_scorer import geometry as geo                      # noqa: E402
@@ -29,6 +31,33 @@ from dart_scorer.webapp import serve                         # noqa: E402
 
 def check(condition, message):
     assert condition, message
+
+
+# JPEG start- and end-of-image markers, spelled without escapes so nothing can
+# mangle them on the way into this file.
+SOI = bytes.fromhex("ffd8ff")
+EOI = bytes.fromhex("ffd9")
+
+
+def _first_stream_frame(server, path, timeout=20.0):
+    """One JPEG out of an MJPEG stream."""
+    req = urllib.request.urlopen(f"http://127.0.0.1:{server.port}{path}",
+                                 timeout=timeout)
+    buf = b""
+    deadline = time.monotonic() + timeout
+    try:
+        while time.monotonic() < deadline:
+            chunk = req.read(16384)
+            if not chunk:
+                break
+            buf += chunk
+            start = buf.find(SOI)
+            end = buf.find(EOI, start + 3) if start >= 0 else -1
+            if start >= 0 and end > 0:
+                return buf[start:end + 2]
+    finally:
+        req.close()
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -76,12 +105,15 @@ def test_an_upright_camera_reads_no_roll():
 
 def test_tip_mode_follows_the_readme_table():
     # "lowest - the camera is above the board", and so on round the board.
+    # Only for a camera mounted almost in the plane of the board.
     for bearing, want in ((0, "leftmost"), (90, "lowest"),
                           (180, "rightmost"), (270, "highest")):
-        got = tip_mode_for_bearing(bearing, elevation_deg=15.0)
+        got = tip_mode_for_bearing(bearing, elevation_deg=6.0)
         check(got == want, f"a camera at {bearing} deg should use {want}, got {got}")
-    check(tip_mode_for_bearing(0, elevation_deg=70.0) == "centre",
-          "a camera looking down at the board uses the usual rule")
+    for elevation in (20.0, 45.0, 70.0):
+        check(tip_mode_for_bearing(0, elevation_deg=elevation) == "centre",
+              f"a camera {elevation} deg above the board uses the usual rule - "
+              "reaching for a quadrant rule sooner than that is a regression")
 
 
 # --------------------------------------------------------------------------- #
@@ -154,6 +186,11 @@ class _Server:
     def get(self, path):
         with urllib.request.urlopen(f"http://127.0.0.1:{self.port}{path}") as r:
             return json.loads(r.read())
+
+    def raw(self, path):
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.port}{path}",
+                                    timeout=25) as r:
+            return r.read()
 
     def post(self, path, body):
         req = urllib.request.Request(
@@ -259,6 +296,104 @@ def test_the_camera_probe_still_reports_the_old_shape():
         data = s.get("/api/cameras")
         check(isinstance(data.get("cameras"), list), "the old key must survive")
         check(isinstance(data.get("devices"), list), "the new one carries labels")
+
+
+# --------------------------------------------------------------------------- #
+# a second camera has to be usable, not just configurable
+# --------------------------------------------------------------------------- #
+def test_a_second_camera_opens_and_streams_on_its_own():
+    with _Server() as s:
+        s.post("/api/views", {"name": "side", "add": True, "source": "demo"})
+        deadline = time.monotonic() + 45
+        while time.monotonic() < deadline:
+            side = [v for v in s.get("/api/views")["views"] if v["name"] == "side"][0]
+            if side["open"] and side["runtime"]["frame_size"]:
+                break
+            time.sleep(0.2)
+        check(side["open"], f"the second camera never opened: {side['runtime']}")
+        check(side["runtime"]["state"] == "live",
+              f"expected live, got {side['runtime']['state']}")
+        check(len(s.raw("/snapshot.jpg?view=side")) > 1000,
+              "it should have a picture of its own")
+
+
+def test_calibrating_a_second_camera_leaves_the_first_alone():
+    with _Server() as s:
+        s.post("/api/views", {"name": "side", "add": True, "source": "demo"})
+        deadline = time.monotonic() + 45
+        while time.monotonic() < deadline:
+            side = [v for v in s.get("/api/views")["views"] if v["name"] == "side"][0]
+            if side["open"] and side["runtime"]["frame_size"]:
+                break
+            time.sleep(0.2)
+        before = s.get("/api/views")["views"][0]["measured"]
+
+        pts = DemoSource().calibration.image_points
+        s.post("/api/calibration?view=side", {"points": pts, "save": True})
+
+        info = s.get("/api/views")
+        side = [v for v in info["views"] if v["name"] == "side"][0]
+        check(side["calibrated"], "the second camera should now be calibrated")
+        check(side["measured"] is not None, "and its pose measurable")
+        check(info["views"][0]["measured"] == before,
+              "calibrating the second camera must not touch the first")
+        check(len(s.raw("/rectified.jpg?view=side")) > 1000,
+              "its board should warp flat too")
+
+
+def test_a_calibrated_second_camera_draws_the_board_on_its_live_video():
+    """The overlay has to be on the *stream*, not only on a still.
+
+    Everyone setting a camera up is watching the live picture, so an overlay
+    that only appears in snapshot.jpg looks exactly like a calibration that
+    silently failed to save.
+    """
+    import cv2
+    with _Server() as s:
+        s.post("/api/views", {"name": "side", "add": True, "source": "demo"})
+        deadline = time.monotonic() + 45
+        while time.monotonic() < deadline:
+            side = [v for v in s.get("/api/views")["views"] if v["name"] == "side"][0]
+            if side["open"] and side["runtime"]["frame_size"]:
+                break
+            time.sleep(0.2)
+
+        plain = _first_stream_frame(s, "/stream.mjpg?view=side")
+        s.post("/api/calibration?view=side",
+               {"points": DemoSource().calibration.image_points, "save": True})
+        drawn = _first_stream_frame(s, "/stream.mjpg?view=side")
+
+        check(plain is not None and drawn is not None, "no streamed frames")
+        # The overlay is drawn in BGR (0, 200, 255) - a strong amber the board
+        # itself does not contain - so counting those pixels separates "drawn"
+        # from "not drawn" without depending on where the rings land.
+        def amber(buf):
+            img = cv2.imdecode(np.frombuffer(buf, np.uint8), cv2.IMREAD_COLOR)
+            b, g, r = img[:, :, 0], img[:, :, 1], img[:, :, 2]
+            return int(((r > 200) & (g > 150) & (g < 235) & (b < 100)).sum())
+        before, after = amber(plain), amber(drawn)
+        check(after > before + 500,
+              f"the board should be drawn on the live stream: {before} -> {after}")
+
+
+def test_a_second_camera_keeps_its_landmarks_beside_the_first():
+    """Not in the working directory: deployed, that is read-only."""
+    with _Server() as s:
+        info = s.post("/api/views", {"name": "side", "add": True, "source": "demo"})
+        side = [v for v in info["views"] if v["name"] == "side"][0]
+        primary = Path(info["views"][0]["calibration_path"])
+        check(Path(side["calibration_path"]).parent == primary.parent,
+              f"{side['calibration_path']} should sit beside {primary}")
+        check(Path(side["calibration_path"]).is_absolute()
+              or str(primary.parent) not in ("", "."),
+              "a bare relative name would resolve against the wrong directory")
+
+
+def test_naming_the_primary_explicitly_is_the_same_as_naming_nothing():
+    with _Server() as s:
+        a = s.get("/api/calibration")
+        b = s.get("/api/calibration?view=primary")
+        check(a == b, "the browser should be able to address every camera alike")
 
 
 # --------------------------------------------------------------------------- #

@@ -9,6 +9,7 @@
 set -euo pipefail
 
 PREFIX=/opt/dart-scorer
+KINECT=0
 STATE=/var/lib/dart-scorer
 USERNAME=dartscorer
 SOURCE=""
@@ -21,6 +22,7 @@ while [[ $# -gt 0 ]]; do
     --port)   PORT="$2"; shift 2 ;;
     --token)  TOKEN="$2"; shift 2 ;;
     --prefix) PREFIX="$2"; shift 2 ;;
+    --with-kinect) KINECT=1; shift ;;
     -h|--help) sed -n '2,9p' "$0"; exit 0 ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac
@@ -34,6 +36,28 @@ id -u "$USERNAME" >/dev/null 2>&1 || \
   useradd --system --home-dir "$PREFIX" --shell /usr/sbin/nologin "$USERNAME"
 # Cameras are owned by the video group.
 usermod -aG video "$USERNAME"
+
+# --- optional: the Kinect v1 ------------------------------------------------
+# Off by default, so a plain install still adds no apt packages at all. The
+# Kinect is reached through libfreenect over raw USB rather than V4L2, so it
+# needs the library, a group that can open the USB nodes, and the matching
+# DeviceAllow line in the unit (which is already there).
+if [[ "$KINECT" == "1" ]]; then
+  echo "==> Kinect support"
+  apt-get update -qq
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends     libfreenect-dev freenect
+  groupadd -f kinect
+  usermod -aG kinect "$USERNAME"
+  install -m 644 "$HERE/deploy/51-kinect.rules" /etc/udev/rules.d/51-kinect.rules
+  # gspca_kinect claims the Kinect camera as a V4L2 device that enumerates but
+  # cannot stream, which both breaks it and renumbers every other camera.
+  install -m 644 "$HERE/deploy/kinect-blacklist.conf"     /etc/modprobe.d/dart-scorer-kinect.conf
+  modprobe -r gspca_kinect 2>/dev/null || true
+  udevadm control --reload && udevadm trigger --subsystem-match=usb
+  if "$PREFIX/.venv/bin/python" -c "from dart_scorer.kinect import kinect_status as k; import sys; s=k(); print('    ' + (('ready, ' + str(s[\"plugged_in\"]) + ' plugged in') if s['available'] else s['reason'])); sys.exit(0)" 2>/dev/null; then :; else
+    echo "    (could not query it yet - it is checked again when the service starts)"
+  fi
+fi
 
 echo "==> code -> $PREFIX"
 install -d -o "$USERNAME" -g "$USERNAME" "$PREFIX" "$STATE"

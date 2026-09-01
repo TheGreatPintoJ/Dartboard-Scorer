@@ -16,32 +16,137 @@ Two things to know before switching between them:
   and NumPy, and it stays that way: with no Kinect, no libfreenect, or on
   Windows, everything here reports itself unavailable and the app behaves
   exactly as it always did.
+
+The library is reached through ctypes rather than libfreenect's own Cython
+wrapper. That wrapper has to be compiled against the exact Python and NumPy in
+use and is not packaged for either, so on anything current it is a build that
+fails. ``libfreenect_sync`` is four C functions with plain integer arguments -
+get a frame, set the tilt, stop - so binding it directly costs about sixty
+lines, needs no compiler, and cannot break on a NumPy ABI change. Installing is
+then just ``apt install libfreenect-dev``.
 """
 
 from __future__ import annotations
 
+import ctypes
 import threading
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
-
-# Deliberately broad. The cython wrapper raises OSError when libfreenect.so is
-# not on the loader path and ImportError on a numpy ABI mismatch, and a bare
-# ImportError guard would take the whole service down on a half-finished
-# install - the exact situation this guard exists for.
-try:
-    import freenect as _freenect
-    FREENECT_ERROR: str | None = None
-except Exception as exc:                       # pragma: no cover - env specific
-    _freenect = None
-    FREENECT_ERROR = f"{type(exc).__name__}: {exc}"
 
 # Kinect v1's own limits, worth stating where they are used rather than in a
 # comment somewhere else.
 MIN_RANGE_MM = 800
 MAX_RANGE_MM = 4000
 STREAMS = ("rgb", "ir", "depth")
+
+# libfreenect's own enums, from libfreenect.h. Spelled out because they are the
+# only part of its API this needs and they never change.
+VIDEO_RGB = 0
+VIDEO_IR_8BIT = 2
+DEPTH_REGISTERED = 4        # millimetres, already aligned to the colour camera
+
+# The Kinect's three USB interfaces. The camera is the one that matters; the
+# motor turning up without it means the 12 V supply is not connected.
+USB_VENDOR = "045e"
+USB_CAMERA = "02ae"
+USB_MOTOR = "02c2"
+
+_SONAMES = ("libfreenect_sync.so.0.5", "libfreenect_sync.so.0",
+            "libfreenect_sync.so")
+
+
+def _load():
+    """The sync library, or the reason it could not be loaded."""
+    last = "libfreenect is not installed"
+    for name in _SONAMES:
+        try:
+            lib = ctypes.CDLL(name)
+        except OSError as exc:
+            last = str(exc)
+            continue
+        ptr = ctypes.POINTER(ctypes.c_void_p)
+        stamp = ctypes.POINTER(ctypes.c_uint32)
+        lib.freenect_sync_get_video.argtypes = [ptr, stamp, ctypes.c_int, ctypes.c_int]
+        lib.freenect_sync_get_video.restype = ctypes.c_int
+        lib.freenect_sync_get_depth.argtypes = [ptr, stamp, ctypes.c_int, ctypes.c_int]
+        lib.freenect_sync_get_depth.restype = ctypes.c_int
+        lib.freenect_sync_set_tilt_degs.argtypes = [ctypes.c_int, ctypes.c_int]
+        lib.freenect_sync_set_tilt_degs.restype = ctypes.c_int
+        lib.freenect_sync_stop.argtypes = []
+        lib.freenect_sync_stop.restype = None
+        return lib, None
+    return None, last
+
+
+_lib, FREENECT_ERROR = _load()
+
+# libfreenect is not thread-safe and its sync API keeps one global device
+# handle, so every call goes through one lock.
+_call_lock = threading.Lock()
+
+
+def _grab(index: int, stream: str):
+    """One frame, as a numpy array. Raises if the device will not give one."""
+    if _lib is None:
+        raise RuntimeError(unavailable_reason())
+    buf = ctypes.c_void_p()
+    stamp = ctypes.c_uint32()
+    if stream == "depth":
+        fn, fmt, shape, dtype = (_lib.freenect_sync_get_depth, DEPTH_REGISTERED,
+                                 (480, 640), np.uint16)
+    elif stream == "ir":
+        fn, fmt, shape, dtype = (_lib.freenect_sync_get_video, VIDEO_IR_8BIT,
+                                 (480, 640), np.uint8)
+    else:
+        fn, fmt, shape, dtype = (_lib.freenect_sync_get_video, VIDEO_RGB,
+                                 (480, 640, 3), np.uint8)
+    with _call_lock:
+        rc = fn(ctypes.byref(buf), ctypes.byref(stamp), int(index), fmt)
+        if rc != 0 or not buf:
+            raise RuntimeError(f"the Kinect returned no {stream} frame (rc={rc})")
+        # Copied out deliberately: libfreenect hands back a pointer into a
+        # buffer it reuses on the very next call.
+        nbytes = int(np.prod(shape)) * np.dtype(dtype).itemsize
+        raw = ctypes.string_at(buf, nbytes)
+    return np.frombuffer(raw, dtype=dtype).reshape(shape), int(stamp.value)
+
+
+def usb_devices() -> list[str]:
+    """Kinect cameras on the USB bus, found without libfreenect.
+
+    Whether a Kinect is plugged in should not depend on whether its driver is
+    installed - otherwise a missing driver and missing hardware look identical.
+    """
+    root = Path("/sys/bus/usb/devices")
+    if not root.is_dir():
+        return []
+    found = []
+    for dev in sorted(root.iterdir()):
+        try:
+            if (dev / "idVendor").read_text().strip() == USB_VENDOR and \
+                    (dev / "idProduct").read_text().strip() == USB_CAMERA:
+                found.append(dev.name)
+        except OSError:
+            continue
+    return found
+
+
+def usb_motors() -> int:
+    root = Path("/sys/bus/usb/devices")
+    if not root.is_dir():
+        return 0
+    count = 0
+    for dev in sorted(root.iterdir()):
+        try:
+            if (dev / "idVendor").read_text().strip() == USB_VENDOR and \
+                    (dev / "idProduct").read_text().strip() == USB_MOTOR:
+                count += 1
+        except OSError:
+            continue
+    return count
 
 
 def is_kinect_source(source) -> bool:
@@ -57,31 +162,27 @@ def device_index(source) -> int:
 
 
 def available() -> bool:
-    return _freenect is not None
+    """Whether a Kinect could actually be opened: driver present and hardware on."""
+    return _lib is not None and bool(usb_devices())
 
 
 def unavailable_reason() -> str:
-    if _freenect is not None:
-        return ""
-    return (FREENECT_ERROR or "libfreenect is not installed")
+    if _lib is None:
+        return (FREENECT_ERROR or "libfreenect is not installed")
+    if not usb_devices():
+        if usb_motors():
+            return ("the Kinect's motor is on the USB bus but its camera is not "
+                    "- the 12 V power adapter is not connected")
+        return "no Kinect on the USB bus"
+    return ""
 
 
 def kinect_status() -> dict:
     """What the UI needs to decide whether to offer the stream selector."""
-    if _freenect is None:
-        return {"available": False, "devices": 0,
-                "reason": unavailable_reason(), "streams": list(STREAMS)}
-    try:
-        count = int(_freenect.num_devices())
-    except Exception as exc:
-        return {"available": False, "devices": 0,
-                "reason": f"libfreenect is installed but unusable: {exc}",
-                "streams": list(STREAMS)}
-    reason = "" if count else (
-        "no Kinect on the bus. Check `lsusb | grep 045e` - if the motor (02b0) "
-        "shows but the camera (02ae) does not, the 12 V adapter is not plugged in")
-    return {"available": bool(count), "devices": count, "reason": reason,
-            "streams": list(STREAMS)}
+    plugged = usb_devices()
+    return {"available": available(), "devices": len(plugged),
+            "plugged_in": len(plugged), "reason": unavailable_reason(),
+            "driver": _lib is not None, "streams": list(STREAMS)}
 
 
 def depth_to_bgr(depth, lo: int = MIN_RANGE_MM, hi: int = MAX_RANGE_MM):
@@ -111,7 +212,7 @@ class KinectSource:
     """
 
     def __init__(self, index: int = 0, stream: str = "rgb", orient=None) -> None:
-        if _freenect is None:
+        if _lib is None or not usb_devices():
             raise RuntimeError(unavailable_reason())
         if stream not in STREAMS:
             raise ValueError(f"{stream!r} is not one of {', '.join(STREAMS)}")
@@ -131,19 +232,14 @@ class KinectSource:
     # -- capture ---------------------------------------------------------- #
     def _grab(self):
         """One (picture, depth) pair from the device."""
+        frame, _ = _grab(self.index, self.stream)
         if self.stream == "rgb":
-            rgb, _ = _freenect.sync_get_video(self.index)
-            return cv2.cvtColor(np.asarray(rgb), cv2.COLOR_RGB2BGR), None
+            return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR), None
         if self.stream == "ir":
-            ir, _ = _freenect.sync_get_video(
-                self.index, _freenect.VIDEO_IR_8BIT)
-            return cv2.cvtColor(np.asarray(ir, np.uint8), cv2.COLOR_GRAY2BGR), None
-        # Registered depth comes back already aligned to the colour camera and
+            return cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR), None
+        # Registered depth arrives already aligned to the colour camera and
         # already in millimetres, so there is no 11-bit table to undo here.
-        depth, _ = _freenect.sync_get_depth(
-            self.index, _freenect.DEPTH_REGISTERED)
-        depth = np.asarray(depth, np.uint16)
-        return depth_to_bgr(depth), depth
+        return depth_to_bgr(frame), frame
 
     def _drain(self) -> None:
         from .camera import orient_frame
@@ -184,7 +280,8 @@ class KinectSource:
         if self._thread:
             self._thread.join(timeout=1.0)
         try:
-            _freenect.sync_stop()
+            with _call_lock:
+                _lib.freenect_sync_stop()
         except Exception:                              # already gone
             pass
 
@@ -202,7 +299,8 @@ class KinectSource:
         tilt = (controls or {}).get("tilt")
         if tilt is not None:
             try:
-                _freenect.sync_set_tilt_degs(int(tilt), self.index)
+                with _call_lock:
+                    _lib.freenect_sync_set_tilt_degs(int(tilt), self.index)
             except Exception as exc:
                 self._error = f"tilt failed: {exc}"
         return self.read_controls(controls)
