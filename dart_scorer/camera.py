@@ -118,12 +118,19 @@ def open_capture(cfg):
     """
     source = str(cfg.source).strip()
     is_index = source.isdigit()
+    # A camera can also be named by its device node. /dev/v4l/by-id/... is the
+    # only way to point at one camera and keep pointing at it: indices are
+    # assigned in probe order, so plugging anything else in - or a kernel module
+    # claiming a device and later being blacklisted - silently renumbers them.
+    is_device = source.startswith("/dev/")
+    is_camera = is_index or is_device
 
-    if is_index:
+    if is_camera:
         name = (cfg.backend or "auto").lower()
         if name in ("", "auto"):
             name = default_backend()
-        cap = cv2.VideoCapture(int(source), BACKENDS.get(name, cv2.CAP_ANY))
+        api = BACKENDS.get(name, cv2.CAP_ANY)
+        cap = cv2.VideoCapture(int(source) if is_index else source, api)
     else:
         # Files and URLs: let OpenCV choose, a webcam backend would refuse.
         cap = cv2.VideoCapture(source)
@@ -132,7 +139,10 @@ def open_capture(cfg):
         cap.release()
         return None
 
-    if is_index and cfg.fourcc:
+    if is_camera and cfg.fourcc:
+        # Applies to a device path as much as an index: without it the driver
+        # hands back uncompressed YUYV, which does not fit down USB 2.0 at 720p
+        # and halves the frame rate.
         code = cfg.fourcc.upper()[:4].ljust(4)
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*code))
     if cfg.width:
@@ -145,8 +155,9 @@ def open_capture(cfg):
         # Best effort - not every backend implements it.
         cap.set(cv2.CAP_PROP_BUFFERSIZE, cfg.buffer_size)
 
-    # A file is not live: read it at the pace the caller asks for.
-    live = is_index or "://" in source
+    # A file is not live: read it at the pace the caller asks for. A camera is,
+    # whether it was named by index or by device node, so it needs draining.
+    live = is_camera or "://" in source
     return CameraSource(cap, source, drain=live,
                         index=int(source) if is_index else None,
                         orient=getattr(cfg, "placement", None))
@@ -178,13 +189,20 @@ _CONTROL_LINE = re.compile(
     r"^\s*(?P<name>\w+)\s+0x[0-9a-fA-F]+\s+\((?P<kind>\w+)\)\s*:\s*(?P<rest>.*)$")
 
 
-def v4l2_ranges(index: int, timeout: float = 2.0) -> dict:
-    """min/max/step/default per control, from v4l2-ctl. {} when unavailable."""
+def v4l2_ranges(device, timeout: float = 2.0) -> dict:
+    """min/max/step/default per control, from v4l2-ctl. {} when unavailable.
+
+    Takes an index or a device node, so a camera named by its stable
+    /dev/v4l/by-id/... path keeps its real slider bounds.
+    """
     if not sys.platform.startswith("linux"):
         return {}
+    node = str(device)
+    if not node.startswith("/dev/"):
+        node = f"/dev/video{node}"
     try:
         out = subprocess.run(
-            ["v4l2-ctl", "-d", f"/dev/video{index}", "--list-ctrls"],
+            ["v4l2-ctl", "-d", node, "--list-ctrls"],
             capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError):
         return {}                                  # v4l2-utils not installed
@@ -317,7 +335,9 @@ class CameraSource:
         """Current value of every control, with what was asked for alongside."""
         requested = requested or {}
         if self._ranges is None:
-            self._ranges = v4l2_ranges(self._index) if self._index is not None else {}
+            probe = self._index if self._index is not None else (
+                self.name if str(self.name).startswith("/dev/") else None)
+            self._ranges = v4l2_ranges(probe) if probe is not None else {}
         out = {}
         for name, prop in CONTROLS.items():
             try:

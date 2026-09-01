@@ -139,7 +139,8 @@ class _Server:
         self.httpd = serve(self.engine, "127.0.0.1", 0)
         self.port = self.httpd.server_address[1]
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
-        deadline = time.monotonic() + 5
+        # Building the demo board takes several seconds on a Raspberry Pi.
+        deadline = time.monotonic() + 45
         while time.monotonic() < deadline and self.engine._raw is None:
             time.sleep(0.02)
         return self

@@ -25,7 +25,11 @@ def check(condition, message):
     assert condition, message
 
 
-def wait_for(predicate, timeout=5.0):
+# Generous on purpose. Building the demo board takes about seven seconds on a
+# Raspberry Pi 3, so a tight timeout here fails on the very hardware this is
+# meant to run on. Polling returns as soon as the condition holds, so a long
+# ceiling costs nothing on a fast machine.
+def wait_for(predicate, timeout=45.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():
@@ -84,7 +88,7 @@ def test_a_backend_that_raises_does_not_kill_scoring():
                   f"the reason should reach the browser, got {err!r}")
             # The real regression: it must still be trying, not dead.
             before = len(calls)
-            check(wait_for(lambda: len(calls) > before, timeout=6.0),
+            check(wait_for(lambda: len(calls) > before, timeout=30.0),
                   "the engine stopped retrying - the scoring thread died")
             check(scoring_threads(), "the scoring thread should still be alive")
     finally:
@@ -97,11 +101,11 @@ def test_the_demo_board_still_scores():
         check(wait_for(lambda: eng._raw is not None), "no frames arrived")
         check(wait_for(lambda: eng.status()["calibrated"]),
               "the demo source should install its own calibration")
-        check(wait_for(lambda: eng.status()["state"] == "ready", timeout=10.0),
+        check(wait_for(lambda: eng.status()["state"] == "ready", timeout=60.0),
               f"expected 'ready', got {eng.status()['state']!r}")
 
         eng.command("throw", label="T20")
-        check(wait_for(lambda: eng.status()["session"]["visit"], timeout=10.0),
+        check(wait_for(lambda: eng.status()["session"]["visit"], timeout=60.0),
               "a thrown dart should be scored")
         labels = [d["label"] for d in eng.status()["session"]["visit"]]
         check(labels == ["T20"], f"expected a T20, got {labels}")

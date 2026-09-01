@@ -1,5 +1,11 @@
 [Unit]
 Description=Dartboard scorer web service
+# Rate limiting lives in [Unit], not [Service]: systemd silently ignores it in
+# [Service] and falls back to its 10-second default. A camera that disappears
+# makes the process retry rather than exit, so a restart loop here means
+# something is genuinely wrong.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 Documentation=https://github.com/local/dart-scorer
 After=network-online.target
 Wants=network-online.target
@@ -34,10 +40,7 @@ ExecStart=/opt/dart-scorer/.venv/bin/python -m dart_scorer serve \
 
 Restart=always
 RestartSec=3
-# A camera that disappears makes the process retry rather than exit, so a
-# restart loop here means something is genuinely wrong.
-StartLimitIntervalSec=60
-StartLimitBurst=5
+
 
 # --- hardening -------------------------------------------------------------
 NoNewPrivileges=yes
